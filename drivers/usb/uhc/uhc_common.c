@@ -98,7 +98,7 @@ struct uhc_transfer *uhc_xfer_alloc(const struct device *dev,
 				    void *const cb_priv)
 {
 	uint8_t ep_idx = USB_EP_GET_IDX(ep) & 0xF;
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	struct uhc_transfer *xfer = NULL;
 	uint16_t mps;
 	uint16_t interval;
@@ -183,7 +183,7 @@ struct uhc_transfer *uhc_xfer_alloc_with_buf(const struct device *dev,
 
 int uhc_xfer_free(const struct device *dev, struct uhc_transfer *const xfer)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	int ret = 0;
 
 	api->lock(dev);
@@ -206,7 +206,7 @@ int uhc_xfer_buf_add(const struct device *dev,
 		     struct uhc_transfer *const xfer,
 		     struct net_buf *buf)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	int ret = 0;
 
 	api->lock(dev);
@@ -223,7 +223,7 @@ int uhc_xfer_buf_add(const struct device *dev,
 
 int uhc_ep_enqueue(const struct device *dev, struct uhc_transfer *const xfer)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	int ret;
 
 	api->lock(dev);
@@ -248,7 +248,7 @@ ep_enqueue_error:
 
 int uhc_ep_dequeue(const struct device *dev, struct uhc_transfer *const xfer)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	int ret;
 
 	api->lock(dev);
@@ -269,7 +269,7 @@ ep_dequeue_error:
 
 int uhc_enable(const struct device *dev)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	struct uhc_data *data = dev->data;
 	int ret;
 
@@ -298,7 +298,7 @@ uhc_enable_error:
 
 int uhc_disable(const struct device *dev)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	struct uhc_data *data = dev->data;
 	int ret;
 
@@ -321,7 +321,7 @@ uhc_disable_error:
 int uhc_init(const struct device *dev,
 	     uhc_event_cb_t event_cb, const void *const event_ctx)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	struct uhc_data *data = dev->data;
 	int ret;
 
@@ -354,7 +354,7 @@ uhc_init_error:
 
 int uhc_shutdown(const struct device *dev)
 {
-	const struct uhc_api *api = dev->api;
+	const struct uhc_driver_api *api = DEVICE_API_GET(uhc, dev);
 	struct uhc_data *data = dev->data;
 	int ret;
 
