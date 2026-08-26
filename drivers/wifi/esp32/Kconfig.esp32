@@ -5,7 +5,6 @@ menuconfig WIFI_ESP32
 	default y
 	depends on DT_HAS_ESPRESSIF_ESP32_WIFI_ENABLED
 	depends on ZEPHYR_HAL_ESPRESSIF_MODULE_BLOBS || BUILD_ONLY_NO_BLOBS
-	depends on !SMP
 	select THREAD_CUSTOM_DATA
 	select NET_L2_WIFI_MGMT
 	select NET_L2_ETHERNET
@@ -15,9 +14,16 @@ menuconfig WIFI_ESP32
 	select DYNAMIC_THREAD
 	select DYNAMIC_THREAD_ALLOC
 	help
-	  Enable ESP32 SoC WiFi support. Only supported in single
-	  core mode because the network stack is not aware of SMP
-	  stuff.
+	  Enable ESP32 SoC WiFi support. The upstream blob's WiFi task
+	  self-pins to core0 (ESP-IDF's PRO_CPU default); when CONFIG_SMP=y,
+	  the board integration is responsible for pinning every
+	  Zephyr-side wifi-facing thread (net stack TX/RX, mesh MAC TX/RX,
+	  etc.) to core0 too — see AkiraEar's net_tc.c and mesh_mac.c
+	  patches. Without that discipline, Zephyr's scheduler is free to
+	  migrate those threads to the other core and race the blob's
+	  internal state, which is closed-source and not auditable for
+	  cross-core safety. AkiraEar-local change — not upstream Zephyr
+	  behavior.
 
 if WIFI_ESP32
 

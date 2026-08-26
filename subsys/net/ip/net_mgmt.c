@@ -436,3 +436,25 @@ void net_mgmt_event_init(void)
 		CONFIG_NET_MGMT_EVENT_STACK_SIZE);
 #endif /* CONFIG_NET_MGMT_EVENT_THREAD */
 }
+
+void net_mgmt_event_thread_pin_core0(void)
+{
+#if defined(CONFIG_NET_MGMT_EVENT_THREAD) && defined(CONFIG_SMP) && defined(CONFIG_WIFI_ESP32)
+	/* AkiraEar: net_mgmt_event_init() (above) runs via SYS_INIT(net_init,
+	 * POST_KERNEL, ...) — very early in boot. Pinning mgmt_work_q_obj's
+	 * thread from inside that same early call didn't stick (this project's
+	 * homegrown ESP32-S3 SMP port has the same class of issue with very-
+	 * early-boot thread setup as the one that broke AkiraEar's mesh_mac.c
+	 * K_THREAD_DEFINE threads — see vault note
+	 * 2026-08-06-smp-cpu-pin-cross-core-ipi-stall. Fix there was creating
+	 * those threads dynamically, later; the equivalent fix here is calling
+	 * this pin from app code well after boot instead of inline in
+	 * net_mgmt_event_init(). NET_EVENT_WIFI_CONNECT_RESULT and
+	 * NET_EVENT_IPV4_ADDR_ADD are delivered through this exact work queue,
+	 * so if it stalls, radio_wifi.c's connect_sem is never given (STA
+	 * association succeeds at the driver level — wifi_status shows
+	 * Connected — but the app-level wait times out) and DHCP-assigned IPs
+	 * never arrive either. */
+	k_thread_cpu_pin(mgmt_work_q_obj.thread_id, 0);
+#endif
+}

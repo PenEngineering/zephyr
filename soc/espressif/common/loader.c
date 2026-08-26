@@ -16,6 +16,7 @@
 
 #include <esp_app_format.h>
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/zsr.h>
 #include <esp_rom_uart.h>
 #include <esp_flash.h>
 #include <esp_log.h>
@@ -302,8 +303,66 @@ void __start(void)
 	/* Initialize the architecture CPU pointer.  Some of the
 	 * initialization code wants a valid arch_current_thread() before
 	 * arch_kernel_init() is invoked.
-	 */
-	__asm__ __volatile__("wsr.MISC0 %0; rsync" : : "r"(&_kernel.cpus[0]));
+	 *
+	 * AkiraEar: this must target ZSR_CPU (the register the generic
+	 * interrupt-entry fast path in xtensa_asm2.inc.S actually reads via
+	 * `rsr.ZSR_CPU`/CROSS_STACK_CALL to find cpu->nested/cpu->irq_stack),
+	 * NOT a hardcoded MISC0. gen_zsr.py allocates ZSR_CPU dynamically —
+	 * in this build it resolves to MISC1, with MISC0 taken by
+	 * ZSR_A0SAVE. Writing MISC0 here left the real ZSR_CPU register
+	 * (MISC1) uninitialized, so the very first interrupt/exception on
+	 * CPU0 read a garbage cpu pointer and dereferenced it for the ISR
+	 * stack address -> corrupted SP -> double exception fault. Only
+	 * reproduces with CONFIG_SMP=y: without SMP this fast path isn't
+	 * used (single implicit CPU), so this was never hit before. */
+	__asm__ __volatile__("wsr." STRINGIFY(ZSR_CPU) " %0; rsync"
+			      : : "r"(&_kernel.cpus[0]));
+
+#ifdef CONFIG_SMP
+	/* AkiraEar: cpu->irq_stack is normally set later by z_init_cpu()
+	 * (kernel/init.c, called from z_cstart() after z_prep_c()). But
+	 * Espressif's __esp_platform_app_start() (called below, via
+	 * hardware_init()/map_rom_segments() first) runs a long chain of HAL
+	 * bring-up (icache/dcache mode, errata, reset reason, esp_timer,
+	 * flash, efuse, PSRAM) *before* z_prep_c() is ever reached. If any
+	 * interrupt/exception fires during that window (observed: a
+	 * StoreProhibited fault inside xtensa_excint1_c while it was still
+	 * saving __stack_chk_guard, triggered from within
+	 * esp_config_instruction_cache_mode()'s ROM call), the CROSS_STACK_CALL
+	 * fast path (xtensa_asm2.inc.S) switches SP to cpu->irq_stack to take
+	 * it -- which is still NULL/BSS-zero this early, so the switch lands
+	 * on an unmapped address and the handler's very first store faults.
+	 * Since we're already inside exception context (PS.EXCM=1), that
+	 * second fault is unrecoverable -> _DoubleExceptionVector (confirmed
+	 * via JTAG: EXCCAUSE=29 StoreProhibited, SP=~0xffffff74). Only
+	 * reproduces with CONFIG_SMP=y, since only the SMP-aware fast path
+	 * dereferences irq_stack this early. Give CPU0 a valid (if
+	 * temporary) IRQ stack now so any pre-kernel-init interrupt has
+	 * somewhere safe to land; z_init_cpu(0) overwrites this with the
+	 * real z_interrupt_stacks[0] once boot reaches it. */
+	static char __aligned(16) early_irq_stack0[2048];
+
+	_kernel.cpus[0].irq_stack = early_irq_stack0 + sizeof(early_irq_stack0);
+
+	/* AkiraEar: _current (== _kernel.cpus[0].current) has the same
+	 * problem, one level up. With the irq_stack fix above, the ISR entry
+	 * path itself no longer crashes, but the C handler it calls
+	 * (xtensa_excint1_c) unconditionally calls z_smp_global_lock() on
+	 * CONFIG_SMP=y, which dereferences `_current->base.global_lock_count`.
+	 * `current` is normally set by z_dummy_thread_init(&_thread_dummy) in
+	 * z_cstart() -- again, after z_prep_c(), i.e. after all of
+	 * __esp_platform_app_start()'s pre-kernel HAL bring-up. Confirmed via
+	 * JTAG: LoadProhibited at vaddr 0x12 == offsetof(struct k_thread,
+	 * base.global_lock_count) read through a NULL `current`. Seed the
+	 * same dummy-thread Zephyr already uses for secondary CPUs
+	 * (kernel/smp.c) here for CPU0; z_cstart()'s own call re-initializes
+	 * it harmlessly once boot reaches it. */
+	extern struct k_thread _thread_dummy;
+	extern void z_dummy_thread_init(struct k_thread *dummy_thread);
+
+	z_dummy_thread_init(&_thread_dummy);
+	_kernel.cpus[0].current = &_thread_dummy;
+#endif /* CONFIG_SMP */
 
 #endif /* CONFIG_RISCV_GP */
 

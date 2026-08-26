@@ -10,6 +10,7 @@
 #include <zephyr/kernel_structs.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/drivers/interrupt_controller/intc_esp32.h>
+#include <zephyr/zsr.h>
 
 #include <soc.h>
 #include <esp_log.h>
@@ -46,6 +47,211 @@ void esp_appcpu_start(void *entry_point)
 	esp_cpu_reset(1);
 }
 
+/* SMP support — ported from esp32/esp32-mp.c (the only Zephyr SoC in this
+ * tree with a working CONFIG_SMP block; esp32s3 had none). DPORT_* renamed
+ * to SYSTEM_* (confirmed 1:1 in soc/system_reg.h — same bit layout, base
+ * address DR_REG_SYSTEM_BASE instead of DPORT). IPI interrupt sources use
+ * numeric ETS_FROM_CPU_INTR0/1_SOURCE directly instead of DT_NODELABEL(ipi0/
+ * ipi1) — no such devicetree nodes exist for this SoC/board, and
+ * esp_intr_alloc() takes a raw source number anyway, so DT was never load-
+ * bearing here. No per-core cache enable call (unlike esp32-mp.c's Cache_
+ * Flush(1)/Cache_Read_Enable(1)) — confirmed via TRM: ESP32-S3 has ONE
+ * shared, arbitrated ICache/DCache for both cores, not per-core caches, so
+ * there is nothing to enable per-core. UNVERIFIED ON HARDWARE: the ROM-UART
+ * "smp_log" timing dependency documented in esp32-mp.c as required-but-
+ * unexplained for reliable APPCPU start is specific to classic ESP32 ROM;
+ * kept here defensively (same reasoning, same risk) since removing it is
+ * unverified either way and it is cheap to keep. */
+#ifdef CONFIG_SMP
+
+#include <ipi.h>
+#include <zephyr/dt-bindings/interrupt-controller/esp32s3-xtensa-intmux.h>
+#include "esp_intr_alloc.h"
+#include "soc/periph_defs.h"
+
+#ifndef CONFIG_SOC_ESP32S3_PROCPU
+static struct k_spinlock loglock;
+#endif
+
+struct cpustart_rec {
+	int cpu;
+	arch_cpustart_t fn;
+	char *stack_top;
+	void *arg;
+	int vecbase;
+	volatile int *alive;
+};
+
+volatile struct cpustart_rec *start_rec;
+static void *appcpu_top;
+static bool cpus_active[CONFIG_MP_MAX_NUM_CPUS];
+static struct k_spinlock loglock;
+
+/* See esp32-mp.c smp_log() for the full history: at least one board hangs
+ * spuriously on APPCPU start without this, and the cause was never root-
+ * caused even there. Left in place unverified on S3 — cheap insurance,
+ * remove only after confirming boot is reliable without it. */
+void smp_log(const char *msg)
+{
+	k_spinlock_key_t key = k_spin_lock(&loglock);
+
+	while (*msg) {
+		esp_rom_uart_tx_one_char(*msg++);
+	}
+	esp_rom_uart_tx_one_char('\r');
+	esp_rom_uart_tx_one_char('\n');
+
+	k_spin_unlock(&loglock, key);
+}
+
+static void appcpu_entry2(void)
+{
+	volatile int ps, ie;
+
+	__asm__ volatile("rsr.PS %0" : "=r"(ps));
+	ps &= ~(XCHAL_PS_EXCM_MASK | XCHAL_PS_INTLEVEL_MASK);
+	__asm__ volatile("wsr.PS %0" : : "r"(ps));
+
+	ie = 0;
+	__asm__ volatile("wsr.INTENABLE %0" : : "r"(ie));
+	__asm__ volatile("wsr.VECBASE %0" : : "r"(start_rec->vecbase));
+	__asm__ volatile("rsync");
+
+	_cpu_t *cpu = &_kernel.cpus[1];
+
+	/* Must be ZSR_CPU (resolves to MISC1 in this build, see loader.c's
+	 * matching fix for CPU0), not hardcoded MISC0 — MISC0 is
+	 * ZSR_A0SAVE, a different slot. */
+	__asm__ volatile("wsr." STRINGIFY(ZSR_CPU) " %0" : : "r"(cpu));
+
+	smp_log("ESP32S3: APPCPU running");
+
+	*start_rec->alive = 1;
+	start_rec->fn(start_rec->arg);
+}
+
+void z_appcpu_stack_switch(void *stack, void *entry);
+__asm__("\n"
+	".align 4"		"\n"
+	"z_appcpu_stack_switch:"	"\n\t"
+	"entry a1, 16"		"\n\t"
+	"addi a1, a2, 16"	"\n\t"
+	"movi a0, 0"		"\n\t"
+	"wsr.WINDOWSTART a0"	"\n\t"
+	"rsr.PS a0"		"\n\t"
+	"movi a2, 0xfffcffff"	"\n\t"
+	"and a0, a0, a2"	"\n\t"
+	"wsr.PS a0"		"\n\t"
+	"rsync"			"\n\t"
+	"movi a0, 0"		"\n\t"
+	"jx a3"			"\n\t");
+
+static void appcpu_entry1(void)
+{
+	z_appcpu_stack_switch(appcpu_top, appcpu_entry2);
+}
+
+IRAM_ATTR static void esp_crosscore_isr(void *arg)
+{
+	ARG_UNUSED(arg);
+
+	z_sched_ipi();
+
+	const int core_id = esp_core_id();
+
+	if (core_id == 0) {
+		WRITE_PERI_REG(SYSTEM_CPU_INTR_FROM_CPU_0_REG, 0);
+	} else {
+		WRITE_PERI_REG(SYSTEM_CPU_INTR_FROM_CPU_1_REG, 0);
+	}
+}
+
+void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
+		    arch_cpustart_t fn, void *arg)
+{
+	volatile struct cpustart_rec sr;
+	int vb;
+	volatile int alive_flag;
+
+	/* Raw ROM UART, no printk/spinlock — printk produced nothing at this
+	 * boot stage (deferred log backend likely not initialized yet), but
+	 * MCUboot's own banner used exactly this path and DID reach the
+	 * console, so it should work this early too. */
+	{
+		const char *m = "AKIRA: arch_cpu_start entered\r\n";
+		while (*m) {
+			esp_rom_uart_tx_one_char(*m++);
+		}
+	}
+
+	__ASSERT(cpu_num == 1, "ESP32-S3 supports only two CPUs");
+
+	__asm__ volatile("rsr.VECBASE %0\n\t" : "=r"(vb));
+
+	alive_flag = 0;
+
+	sr.cpu = cpu_num;
+	sr.fn = fn;
+	sr.stack_top = K_KERNEL_STACK_BUFFER(stack) + sz;
+	sr.arg = arg;
+	sr.vecbase = vb;
+	sr.alive = &alive_flag;
+
+	appcpu_top = K_KERNEL_STACK_BUFFER(stack) + sz;
+
+	start_rec = &sr;
+
+	printk("AKIRA: arch_cpu_start before esp_appcpu_start\n");
+	esp_appcpu_start(appcpu_entry1);
+	printk("AKIRA: arch_cpu_start after esp_appcpu_start, waiting for alive\n");
+
+	uint32_t spins = 0;
+	while (!alive_flag) {
+		spins++;
+		if ((spins & 0xFFFFF) == 0) {
+			printk("AKIRA: still waiting for alive_flag, spins=%u\n", spins);
+		}
+	}
+	printk("AKIRA: alive_flag set after %u spins\n", spins);
+
+	cpus_active[0] = true;
+	cpus_active[cpu_num] = true;
+
+	esp_intr_alloc(ETS_FROM_CPU_INTR0_SOURCE,
+		ESP_PRIO_TO_FLAGS(IRQ_DEFAULT_PRIORITY) | ESP_INTR_FLAG_IRAM,
+		esp_crosscore_isr, NULL, NULL);
+
+	esp_intr_alloc(ETS_FROM_CPU_INTR1_SOURCE,
+		ESP_PRIO_TO_FLAGS(IRQ_DEFAULT_PRIORITY) | ESP_INTR_FLAG_IRAM,
+		esp_crosscore_isr, NULL, NULL);
+
+	smp_log("ESP32S3: APPCPU initialized");
+}
+
+void arch_sched_directed_ipi(uint32_t cpu_bitmap)
+{
+	const int core_id = esp_core_id();
+
+	ARG_UNUSED(cpu_bitmap);
+
+	if (core_id == 0) {
+		WRITE_PERI_REG(SYSTEM_CPU_INTR_FROM_CPU_0_REG, SYSTEM_CPU_INTR_FROM_CPU_0);
+	} else {
+		WRITE_PERI_REG(SYSTEM_CPU_INTR_FROM_CPU_1_REG, SYSTEM_CPU_INTR_FROM_CPU_1);
+	}
+}
+
+void arch_sched_broadcast_ipi(void)
+{
+	arch_sched_directed_ipi(IPI_ALL_CPUS_MASK);
+}
+
+IRAM_ATTR bool arch_cpu_active(int cpu_num)
+{
+	return cpus_active[cpu_num];
+}
+#endif /* CONFIG_SMP */
+
 static int load_segment(uint32_t src_addr, uint32_t src_len, uint32_t dst_addr)
 {
 	const uint32_t *data = (const uint32_t *)sys_mmap(src_addr, src_len);
@@ -65,6 +271,10 @@ static int load_segment(uint32_t src_addr, uint32_t src_len, uint32_t dst_addr)
 
 	return 0;
 }
+
+/* This whole chain (image_load/_stop/_start/init) only makes sense with a
+ * real slot0_appcpu_partition — see CONFIG_ESP_APPCPU_AUTOLOAD_IMAGE. */
+#ifdef CONFIG_ESP_APPCPU_AUTOLOAD_IMAGE
 
 int IRAM_ATTR esp_appcpu_image_load(unsigned int hdr_offset, unsigned int *entry_addr)
 {
@@ -192,9 +402,19 @@ int esp_appcpu_init(void)
 	return 0;
 }
 
+/* AkiraEar: this auto-init loads a SEPARATE appcpu image from a
+ * slot0_appcpu_partition flash partition — the normal Zephyr AMP sysbuild
+ * flow. We don't use that flow (single-image AMP/SMP via esp_appcpu_start()/
+ * arch_cpu_start() with a raw IRAM function pointer already linked into THIS
+ * binary), and without the partition this SYS_INIT hits an invalid image
+ * header and abort()s at boot. Gated off via CONFIG_ESP_APPCPU_AUTOLOAD_IMAGE
+ * (see common/Kconfig.amp) instead of deleting it, so the stock sysbuild flow
+ * still works for anyone who wants it. */
 #if !defined(CONFIG_MCUBOOT)
 extern int esp_appcpu_init(void);
 SYS_INIT(esp_appcpu_init, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 #endif
+
+#endif /* CONFIG_ESP_APPCPU_AUTOLOAD_IMAGE */
 
 #endif /* CONFIG_SOC_ENABLE_APPCPU */

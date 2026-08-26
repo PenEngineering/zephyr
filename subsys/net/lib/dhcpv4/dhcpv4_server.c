@@ -16,7 +16,6 @@
 #include <zephyr/net/ethernet.h>
 #include <zephyr/net/icmp.h>
 #include <zephyr/net/socket.h>
-#include <zephyr/net/socket_service.h>
 #include <zephyr/sys/byteorder.h>
 
 LOG_MODULE_REGISTER(net_dhcpv4_server, CONFIG_NET_DHCPV4_SERVER_LOG_LEVEL);
@@ -74,8 +73,26 @@ struct dhcpv4_server_ctx {
 static void *address_provider_callback_user_data;
 static net_dhcpv4_server_provider_cb_t address_provider_callback;
 static struct dhcpv4_server_ctx server_ctx[CONFIG_NET_DHCPV4_SERVER_INSTANCES];
-static struct zsock_pollfd fds[CONFIG_NET_DHCPV4_SERVER_INSTANCES];
 static K_MUTEX_DEFINE(server_lock);
+
+/* AkiraEar: net_socket_service's poll-dispatch thread (sockets_service.c)
+ * never wakes to consume a packet already sitting in this socket's recv_q
+ * on this project's homegrown ESP32-S3 SMP port -- live JTAG hardware
+ * breakpoints on dhcpv4_server_cb() showed zero hits across dozens of
+ * attempts, while zsock_received_cb()/k_fifo_put() reliably fired every
+ * time for the same packet. kernel/poll.c's cross-core wake path for a
+ * K_POLL_TYPE_FIFO_DATA_AVAILABLE waiter (signal_poller(), reached via
+ * kernel/queue.c's handle_poll_events()) is a distinct code path from the
+ * direct k_fifo_get() blocking-wait wake used by a plain blocking recv()
+ * thread; every socket serviced by a dedicated blocking-recv thread
+ * elsewhere in this codebase (AkiraEar's mesh_mac.c RX thread, radio_wifi.c's
+ * mesh UDP socket) has been reliable, only net_socket_service-dispatched
+ * sockets have ever stalled. Workaround: give the DHCPv4 server its own
+ * blocking-recv thread per instance instead of registering with
+ * net_socket_service. See docs/architecture/akiraear-20260820-session-findings.md. */
+static struct k_thread server_thread[CONFIG_NET_DHCPV4_SERVER_INSTANCES];
+static K_THREAD_STACK_ARRAY_DEFINE(server_thread_stack, CONFIG_NET_DHCPV4_SERVER_INSTANCES,
+				    CONFIG_NET_SOCKETS_SERVICE_STACK_SIZE);
 
 static void dhcpv4_server_timeout_recalc(struct dhcpv4_server_ctx *ctx)
 {
@@ -1497,51 +1514,29 @@ static void dhcpv4_process_data(struct dhcpv4_server_ctx *ctx, uint8_t *data,
 	k_mutex_unlock(&server_lock);
 }
 
-static void dhcpv4_server_cb(struct net_socket_service_event *evt)
+static void dhcpv4_server_thread_fn(void *p1, void *p2, void *p3)
 {
-	struct dhcpv4_server_ctx *ctx = NULL;
+	struct dhcpv4_server_ctx *ctx = p1;
 	uint8_t recv_buf[NET_IPV4_MTU];
 	int ret;
 
-	for (int i = 0; i < ARRAY_SIZE(server_ctx); i++) {
-		if (server_ctx[i].sock == evt->event.fd) {
-			ctx = &server_ctx[i];
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (true) {
+		ret = zsock_recvfrom(ctx->sock, recv_buf, sizeof(recv_buf), 0,
+				     NULL, 0);
+		if (ret < 0) {
+			/* Socket closed by net_dhcpv4_server_stop() (or a
+			 * real error) -- either way, this instance is done.
+			 */
+			LOG_DBG("DHCPv4 server recv thread exiting, %d", errno);
 			break;
 		}
+
+		dhcpv4_process_data(ctx, recv_buf, ret);
 	}
-
-	if (ctx == NULL) {
-		LOG_ERR("No DHCPv4 server context found for given FD.");
-		return;
-	}
-
-	if (evt->event.revents & ZSOCK_POLLERR) {
-		LOG_ERR("DHCPv4 server poll revents error");
-		net_dhcpv4_server_stop(ctx->iface);
-		return;
-	}
-
-	if (!(evt->event.revents & ZSOCK_POLLIN)) {
-		return;
-	}
-
-	ret = zsock_recvfrom(evt->event.fd, recv_buf, sizeof(recv_buf),
-			     ZSOCK_MSG_DONTWAIT, NULL, 0);
-	if (ret < 0) {
-		if (errno == EAGAIN) {
-			return;
-		}
-
-		LOG_ERR("DHCPv4 server recv error, %d", errno);
-		net_dhcpv4_server_stop(ctx->iface);
-		return;
-	}
-
-	dhcpv4_process_data(ctx, recv_buf, ret);
 }
-
-NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(dhcpv4_server, dhcpv4_server_cb,
-				      CONFIG_NET_DHCPV4_SERVER_INSTANCES);
 
 int net_dhcpv4_server_start(struct net_if *iface, struct in_addr *base_addr)
 {
@@ -1634,9 +1629,6 @@ int net_dhcpv4_server_start(struct net_if *iface, struct in_addr *base_addr)
 		goto error;
 	}
 
-	fds[slot].fd = sock;
-	fds[slot].events = ZSOCK_POLLIN;
-
 	server_ctx[slot].iface = iface;
 	server_ctx[slot].sock = sock;
 	server_ctx[slot].server_addr = *server_addr;
@@ -1662,13 +1654,14 @@ int net_dhcpv4_server_start(struct net_if *iface, struct in_addr *base_addr)
 		goto cleanup;
 	}
 
-	ret = net_socket_service_register(&dhcpv4_server, fds, ARRAY_SIZE(fds),
-					  NULL);
-	if (ret < 0) {
-		LOG_ERR("Failed to register socket service, %d", ret);
-		dhcpv4_server_probing_deinit(&server_ctx[slot]);
-		goto cleanup;
-	}
+	k_thread_create(&server_thread[slot], server_thread_stack[slot],
+			K_THREAD_STACK_SIZEOF(server_thread_stack[slot]),
+			dhcpv4_server_thread_fn, &server_ctx[slot], NULL, NULL,
+			CLAMP(CONFIG_NET_SOCKETS_SERVICE_THREAD_PRIO,
+			      K_HIGHEST_APPLICATION_THREAD_PRIO,
+			      K_LOWEST_APPLICATION_THREAD_PRIO),
+			0, K_NO_WAIT);
+	k_thread_name_set(&server_thread[slot], "dhcpv4_server");
 
 	k_mutex_unlock(&server_lock);
 
@@ -1676,7 +1669,6 @@ int net_dhcpv4_server_start(struct net_if *iface, struct in_addr *base_addr)
 
 cleanup:
 	memset(&server_ctx[slot], 0, sizeof(server_ctx[slot]));
-	fds[slot].fd = -1;
 
 error:
 	if (sock >= 0) {
@@ -1692,8 +1684,8 @@ int net_dhcpv4_server_stop(struct net_if *iface)
 {
 	struct k_work_sync sync;
 	int slot = -1;
-	int ret = 0;
-	bool service_stop = true;
+	int sock;
+	int ret;
 
 	if (iface == NULL) {
 		return -EINVAL;
@@ -1709,36 +1701,37 @@ int net_dhcpv4_server_stop(struct net_if *iface)
 	}
 
 	if (slot < 0) {
-		ret = -ENOENT;
-		goto out;
+		k_mutex_unlock(&server_lock);
+		return -ENOENT;
 	}
 
-	fds[slot].fd = -1;
-	(void)zsock_close(server_ctx[slot].sock);
+	sock = server_ctx[slot].sock;
+
+	k_mutex_unlock(&server_lock);
+
+	/* Close the socket to unblock dhcpv4_server_thread_fn()'s recvfrom(),
+	 * then wait for that thread to actually exit before touching
+	 * server_ctx[slot] below. Must be done without server_lock held: the
+	 * thread may currently be inside dhcpv4_process_data(), which itself
+	 * takes server_lock, so holding it here while joining would deadlock.
+	 */
+	(void)zsock_close(sock);
+
+	ret = k_thread_join(&server_thread[slot], K_SECONDS(2));
+	if (ret != 0) {
+		LOG_WRN("DHCPv4 server recv thread did not exit in time, %d", ret);
+	}
+
+	k_mutex_lock(&server_lock, K_FOREVER);
 
 	dhcpv4_server_probing_deinit(&server_ctx[slot]);
 	k_work_cancel_delayable_sync(&server_ctx[slot].timeout_work, &sync);
 
 	memset(&server_ctx[slot], 0, sizeof(server_ctx[slot]));
 
-	for (int i = 0; i < ARRAY_SIZE(fds); i++) {
-		if (fds[i].fd >= 0) {
-			service_stop = false;
-			break;
-		}
-	}
-
-	if (service_stop) {
-		ret = net_socket_service_unregister(&dhcpv4_server);
-	} else {
-		ret = net_socket_service_register(&dhcpv4_server, fds,
-						  ARRAY_SIZE(fds), NULL);
-	}
-
-out:
 	k_mutex_unlock(&server_lock);
 
-	return ret;
+	return 0;
 }
 
 static void dhcpv4_server_foreach_lease_on_ctx(struct dhcpv4_server_ctx *ctx,
@@ -1804,8 +1797,4 @@ void net_dhcpv4_server_init(void)
 {
 	address_provider_callback = NULL;
 	address_provider_callback_user_data = NULL;
-
-	for (int i = 0; i < ARRAY_SIZE(fds); i++) {
-		fds[i].fd = -1;
-	}
 }

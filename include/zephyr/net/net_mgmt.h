@@ -428,6 +428,18 @@ void net_mgmt_event_init(void);
 #endif /* CONFIG_NET_MGMT_EVENT */
 
 /**
+ * @brief AkiraEar: pin the net_mgmt event-delivery thread to core0. See the
+ * comment at its call site (net_mgmt.c) for why — no-op unless
+ * CONFIG_SMP && CONFIG_WIFI_ESP32. Meant to be called late (well after boot),
+ * not from the early SYS_INIT that starts the thread.
+ */
+#ifdef CONFIG_NET_MGMT_EVENT
+void net_mgmt_event_thread_pin_core0(void);
+#else
+#define net_mgmt_event_thread_pin_core0(...)
+#endif /* CONFIG_NET_MGMT_EVENT */
+
+/**
  * @}
  */
 

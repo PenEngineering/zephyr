@@ -9,6 +9,20 @@ config SOC_ENABLE_APPCPU
 	help
 	  This hidden configuration lets PROCPU core to map and start APPCPU whenever IPM is enabled.
 
+config ESP_APPCPU_AUTOLOAD_IMAGE
+	bool "Auto-load a separate APPCPU image from flash at boot"
+	default y
+	depends on SOC_ENABLE_APPCPU
+	help
+	  The stock Zephyr AMP flow: at boot, PROCPU loads a SEPARATE Zephyr
+	  image for APPCPU from a slot0_appcpu_partition flash partition
+	  (built via sysbuild) and starts it. Requires that partition to
+	  exist with a valid image, or esp_appcpu_init() aborts at boot.
+	  Disable this if APPCPU is started manually, later, from a single
+	  image (e.g. via esp_appcpu_start()/arch_cpu_start() with a raw
+	  IRAM function pointer already linked into the PROCPU binary) —
+	  no separate image or partition needed in that case.
+
 menu "Espressif AMP Config"
 
 config ESP_APPCPU_IRAM_SIZE

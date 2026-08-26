@@ -68,14 +68,26 @@ static void serial_esp32_usb_poll_out(const struct device *dev, unsigned char c)
 	/*
 	 * If there is no USB host connected, this function will busy-wait once for the timeout
 	 * period, but return immediately for subsequent calls.
+	 *
+	 * The writable-check/write/flush sequence below is a single hardware transaction on the
+	 * shared TX FIFO — same register set serial_esp32_usb_fifo_fill() uses. Under CONFIG_SMP=y
+	 * two cores can call into either function at the same time (e.g. the deferred log thread
+	 * polling out a byte here while an interrupt-driven writer on the other core fills the
+	 * FIFO), and an unguarded interleaving tears the two writes together at the byte level.
+	 * irq_lock()/irq_unlock() (not the busy-wait itself) scope the critical section, matching
+	 * this driver's existing irq_tx_enable() callback protection below.
 	 */
 	do {
+		unsigned int key = irq_lock();
+
 		if (usb_serial_jtag_ll_txfifo_writable()) {
 			usb_serial_jtag_ll_write_txfifo(&c, 1);
 			usb_serial_jtag_ll_txfifo_flush();
 			data->last_tx_time = k_uptime_get();
+			irq_unlock(key);
 			return;
 		}
+		irq_unlock(key);
 	} while ((k_uptime_get() - data->last_tx_time) < USBSERIAL_POLL_OUT_TIMEOUT_MS);
 }
 
@@ -116,9 +128,12 @@ static int serial_esp32_usb_fifo_fill(const struct device *dev, const uint8_t *t
 {
 	ARG_UNUSED(dev);
 
+	/* Same shared TX FIFO as serial_esp32_usb_poll_out() — see the lock comment there. */
+	unsigned int key = irq_lock();
 	int ret = usb_serial_jtag_ll_write_txfifo(tx_data, len);
 
 	usb_serial_jtag_ll_txfifo_flush();
+	irq_unlock(key);
 
 	return ret;
 }
@@ -140,7 +155,7 @@ static void serial_esp32_usb_irq_tx_enable(const struct device *dev)
 	if (data->irq_cb != NULL) {
 		unsigned int key = irq_lock();
 		data->irq_cb(dev, data->irq_cb_data);
-		arch_irq_unlock(key);
+		irq_unlock(key);
 	}
 }
 

@@ -579,7 +579,14 @@ static inline int esp32_usb_otg_init(const struct device *dev,
 
 	ret = clock_control_on(cfg->clock_dev, cfg->clock_subsys);
 
-	if (ret != 0) {
+	/* -EALREADY means the clock is already on, not that anything failed —
+	 * on boards that also have usb_serial active (same ESP32_USB_MODULE
+	 * clock gate, see esp32s3_common.dtsi), its pre-kernel driver init
+	 * already turned this clock on before this quirk ever runs. Only a
+	 * genuine error should abort init here. (AkiraEar Petal — found this
+	 * bringing up usb_otg alongside the existing usb_serial console; see
+	 * docs/architecture/akiraear-usb-otg-bulk-transport.md in that repo.) */
+	if (ret != 0 && ret != -EALREADY) {
 		return ret;
 	}
 

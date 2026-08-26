@@ -364,6 +364,13 @@ void net_tc_tx_init(void)
 		}
 
 		k_thread_start(tid);
+
+#if defined(CONFIG_SMP) && defined(CONFIG_WIFI_ESP32)
+		/* AkiraEar: ESP32 WiFi blob's internal task assumes core0
+		 * (ESP-IDF PRO_CPU default). Keep the net stack's own TX
+		 * threads off core1 so they never race it. */
+		k_thread_cpu_pin(tid, 0);
+#endif
 	}
 #endif
 }
@@ -422,6 +429,34 @@ void net_tc_rx_init(void)
 		}
 
 		k_thread_start(tid);
+
+#if defined(CONFIG_SMP) && defined(CONFIG_WIFI_ESP32)
+		/* AkiraEar: unlike net_tc_tx_init()'s core0 pin (needed because
+		 * TX eventually calls into the closed ESP32 WiFi blob), this RX
+		 * thread only dequeues and delivers already-received net_pkts —
+		 * generic net-stack path, never touches the blob directly (the
+		 * blob's own core0-pinned task already did the RX enqueue). It
+		 * doesn't need core0. Pinning it there anyway forced RX
+		 * processing to compete with I2S/GDMA capture ISRs, backing up
+		 * net_pkt_rx_alloc_with_buffer() under real traffic ("Failed to
+		 * allocate net buffer"). Leaving cpu_mask unrestricted instead
+		 * (the default) was tried and made it WORSE — confirmed via
+		 * `kernel threads` on real hardware: 0 total execution cycles
+		 * since boot, i.e. it never ran at all, not just starved. That's
+		 * a scheduler bug in this project's homegrown ESP32-S3 SMP port
+		 * with multi-core-eligible threads. Pin to core1 explicitly
+		 * instead — away from core0's contention, but still a single,
+		 * unambiguous core.
+		 *
+		 * core1 pin *also* starved this thread in practice — `kernel
+		 * thread list` on real hardware during a live mesh connect
+		 * showed rx_q[0] state=queued (ready, not blocked), cpu_mask=0x2,
+		 * 1338 total execution cycles versus core0 idle sitting at 99%.
+		 * core0 does not (35M+ cycles, full RX pipeline traces cleanly
+		 * every time) — core1 dispatch itself is broken on this SMP
+		 * port, not just contended, so pin here to core0 instead. */
+		k_thread_cpu_pin(tid, 0);
+#endif
 	}
 #endif
 }
