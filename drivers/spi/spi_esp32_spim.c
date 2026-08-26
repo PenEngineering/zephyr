@@ -191,8 +191,15 @@ static int IRAM_ATTR spi_esp32_transfer(const struct device *dev)
 	spi_hal_setup_trans(hal, hal_dev, hal_trans);
 
 #if defined(SOC_GDMA_SUPPORTED)
-	if (cfg->dma_enabled && hal_trans->rcv_buffer && hal_trans->send_buffer) {
-		/* setup DMA channels via DMA driver */
+	/* Half-duplex transfers (spi_write()/spi_read(), e.g. write-only MIPI
+	 * DBI displays) leave one of rcv_buffer/send_buffer NULL. Arm each
+	 * GDMA channel independently on its own buffer's presence — they are
+	 * separate channels — instead of requiring both, or a half-duplex
+	 * caller gets neither the DMA path nor the prepare_data() fallback
+	 * below (prepare_data is unconditionally false whenever dma_enabled),
+	 * and spi_hal_user_start() spins forever in the completion poll with
+	 * no data ever armed. */
+	if (cfg->dma_enabled && hal_trans->rcv_buffer) {
 		spi_ll_dma_rx_fifo_reset(hal->hw);
 		spi_ll_infifo_full_clr(hal->hw);
 		spi_ll_dma_rx_enable(hal->hw, 1);
@@ -202,7 +209,9 @@ static int IRAM_ATTR spi_esp32_transfer(const struct device *dev)
 		if (err) {
 			goto free;
 		}
+	}
 
+	if (cfg->dma_enabled && hal_trans->send_buffer) {
 		spi_ll_dma_tx_fifo_reset(hal->hw);
 		spi_ll_outfifo_empty_clr(hal->hw);
 		spi_ll_dma_tx_enable(hal->hw, 1);
