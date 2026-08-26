@@ -80,6 +80,7 @@ struct cpustart_rec {
 	void *arg;
 	int vecbase;
 	volatile int *alive;
+	uint32_t ccount0;
 };
 
 volatile struct cpustart_rec *start_rec;
@@ -108,6 +109,13 @@ static void appcpu_entry2(void)
 {
 	volatile int ps, ie;
 
+	/* CCOUNT is per-core on Xtensa; xtensa_sys_timer.c's shared
+	 * last_count assumes one continuous counter. Sync CPU1's CCOUNT to
+	 * CPU0's snapshot from handoff so the tick ISR's unsigned subtraction
+	 * never underflows.
+	 */
+	__asm__ volatile("wsr.CCOUNT %0; rsync" : : "r"(start_rec->ccount0));
+
 	__asm__ volatile("rsr.PS %0" : "=r"(ps));
 	ps &= ~(XCHAL_PS_EXCM_MASK | XCHAL_PS_INTLEVEL_MASK);
 	__asm__ volatile("wsr.PS %0" : : "r"(ps));
@@ -126,8 +134,16 @@ static void appcpu_entry2(void)
 
 	smp_log("ESP32S3: APPCPU running");
 
+	/* Snapshot fn/arg before signaling alive: start_rec points at a
+	 * stack-local in CPU0's arch_cpu_start(), which returns and reuses
+	 * that stack the instant alive_flag is observed set. Touching
+	 * start_rec after the signal races CPU0 tearing it down.
+	 */
+	arch_cpustart_t fn = start_rec->fn;
+	void *arg = start_rec->arg;
+
 	*start_rec->alive = 1;
-	start_rec->fn(start_rec->arg);
+	fn(arg);
 }
 
 void z_appcpu_stack_switch(void *stack, void *entry);
@@ -136,8 +152,15 @@ __asm__("\n"
 	"z_appcpu_stack_switch:"	"\n\t"
 	"entry a1, 16"		"\n\t"
 	"addi a1, a2, 16"	"\n\t"
-	"movi a0, 0"		"\n\t"
-	"wsr.WINDOWSTART a0"	"\n\t"
+	/* entry already set WINDOWSTART's bit for this window as its own
+	 * defined side effect (measured live: WINDOWBASE=5 here, so bit 5).
+	 * Writing WINDOWSTART afterward — to 0 (original) or any hardcoded
+	 * bit — clobbers that correct value instead of a real bit, leaving
+	 * this window's call8 overflow-chain linkage never legitimately
+	 * populated. A later _WindowOverflow8 walking back through it then
+	 * reads stale .noinit stack content as a store address
+	 * (StoreProhibited). Just don't touch WINDOWSTART here.
+	 */
 	"rsr.PS a0"		"\n\t"
 	"movi a2, 0xfffcffff"	"\n\t"
 	"and a0, a0, a2"	"\n\t"
@@ -172,6 +195,7 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 	volatile struct cpustart_rec sr;
 	int vb;
 	volatile int alive_flag;
+	uint32_t ccount0;
 
 	/* Raw ROM UART, no printk/spinlock — printk produced nothing at this
 	 * boot stage (deferred log backend likely not initialized yet), but
@@ -202,6 +226,8 @@ void arch_cpu_start(int cpu_num, k_thread_stack_t *stack, int sz,
 	start_rec = &sr;
 
 	printk("AKIRA: arch_cpu_start before esp_appcpu_start\n");
+	__asm__ volatile("rsr.CCOUNT %0" : "=r"(ccount0));
+	sr.ccount0 = ccount0;
 	esp_appcpu_start(appcpu_entry1);
 	printk("AKIRA: arch_cpu_start after esp_appcpu_start, waiting for alive\n");
 
