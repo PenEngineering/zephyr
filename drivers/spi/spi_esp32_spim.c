@@ -563,6 +563,8 @@ static int transceive(const struct device *dev,
 #ifdef CONFIG_SPI_ESP32_INTERRUPT
 	spi_ll_enable_int(cfg->spi);
 	spi_ll_set_int_stat(cfg->spi);
+
+	ret = spi_context_wait_for_completion(&data->ctx);
 #else
 
 	do {
