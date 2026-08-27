@@ -33,6 +33,10 @@ struct gpio_keys_pin_data {
 	const struct device *dev;
 	struct gpio_keys_callback cb_data;
 	struct k_work_delayable work;
+	/* Uptime (ms) of the edge that started the current debounce cycle —
+	 * caps how long gpio_keys_interrupt() can keep pushing the deadline
+	 * out under a continuous edge storm. See gpio_keys_interrupt(). */
+	int64_t first_edge_uptime;
 };
 
 struct gpio_keys_config {
@@ -135,6 +139,22 @@ static void gpio_keys_interrupt(const struct device *dev, struct gpio_callback *
 
 	ARG_UNUSED(dev); /* GPIO device pointer. */
 	ARG_UNUSED(pins);
+
+	/* Every edge (GPIO_INT_EDGE_BOTH) reschedules the same debounce timer,
+	 * uncapped. A continuous edge storm — e.g. capacitive/EMI coupling
+	 * onto a released button's high-impedance pull-up net from another
+	 * actively-toggling pin sharing the same GPIO controller — can keep
+	 * pushing the deadline out forever, so the pin is never sampled and
+	 * a real transition (like a release) is silently lost until the
+	 * storm stops or the debounce work happens to run for an unrelated
+	 * reason. Cap the total deferral to one debounce interval from the
+	 * first edge of the current cycle so it fires on a bounded schedule
+	 * regardless of how many further edges arrive in the meantime. */
+	if (!k_work_delayable_is_pending(&pin_data->work)) {
+		pin_data->first_edge_uptime = k_uptime_get();
+	} else if (k_uptime_get() - pin_data->first_edge_uptime >= cfg->debounce_interval_ms) {
+		return;
+	}
 
 	k_work_reschedule(&pin_data->work, K_MSEC(cfg->debounce_interval_ms));
 }
