@@ -210,14 +210,21 @@ int esp_intr_reserve(int intno, int cpu)
 	return 0;
 }
 
-/* Returns true if handler for interrupt is not the default unhandled interrupt handler */
+/* Returns true if handler for interrupt is not the default unhandled interrupt handler.
+ *
+ * _sw_isr_table is generated with exactly SOC_CPU_INTR_NUM entries (one per
+ * physical Xtensa interrupt line) — it is NOT sized per-cpu. Indexing it as
+ * `intr * CONFIG_MP_MAX_NUM_CPUS + cpu` (as this used to) reads past the
+ * array for any intr >= SOC_CPU_INTR_NUM / CONFIG_MP_MAX_NUM_CPUS once
+ * CONFIG_MP_MAX_NUM_CPUS > 1 (i.e. CONFIG_SMP=y on a 2-core target) — the
+ * garbage read there almost never matches z_irq_spurious, so every such line
+ * was misreported as already handled, cutting get_available_int()'s usable
+ * LOWMED pool in half and starving late allocators like udc_dwc2. */
 static bool intr_has_handler(int intr, int cpu)
 {
-	bool r;
+	ARG_UNUSED(cpu);
 
-	r = _sw_isr_table[intr * CONFIG_MP_MAX_NUM_CPUS + cpu].isr != z_irq_spurious;
-
-	return r;
+	return _sw_isr_table[intr].isr != z_irq_spurious;
 }
 
 static bool is_vect_desc_usable(struct vector_desc_t *vd, int flags, int cpu, int force)

@@ -33,6 +33,7 @@ struct wdt_esp32_data {
 	uint32_t timeout;
 	wdt_stage_action_t mode;
 	wdt_callback_t callback;
+	bool irq_allocated;
 };
 
 struct wdt_esp32_config {
@@ -129,6 +130,7 @@ static int wdt_esp32_set_config(const struct device *dev, uint8_t options)
 static int wdt_esp32_install_timeout(const struct device *dev,
 				     const struct wdt_timeout_cfg *cfg)
 {
+	const struct wdt_esp32_config *const config = dev->config;
 	struct wdt_esp32_data *data = dev->data;
 
 	if (cfg->window.min != 0U || cfg->window.max == 0U) {
@@ -137,6 +139,24 @@ static int wdt_esp32_install_timeout(const struct device *dev,
 
 	data->timeout = cfg->window.max;
 	data->callback = cfg->callback;
+
+	/* Only STAGE0 (an early warning, not the reset itself) needs the ISR
+	 * to run — STAGE1's hardware reset fires from its own independent
+	 * comparator regardless of whether STAGE0's interrupt is ever routed.
+	 * Skip allocating a CPU interrupt line for callback-less (reset-only)
+	 * watchdogs — that line is otherwise permanently wasted. */
+	if (cfg->callback != NULL && !data->irq_allocated) {
+		int flags = ESP_PRIO_TO_FLAGS(config->irq_priority) |
+			    ESP_INT_FLAGS_CHECK(config->irq_flags);
+		int ret = esp_intr_alloc(config->irq_source, flags,
+					 (intr_handler_t)wdt_esp32_isr, (void *)dev, NULL);
+
+		if (ret != 0) {
+			LOG_ERR("could not allocate interrupt (err %d)", ret);
+			return ret;
+		}
+		data->irq_allocated = true;
+	}
 
 	/* Set mode of watchdog and callback */
 	switch (cfg->flags) {
@@ -167,7 +187,6 @@ static int wdt_esp32_init(const struct device *dev)
 {
 	const struct wdt_esp32_config *const config = dev->config;
 	struct wdt_esp32_data *data = dev->data;
-	int ret, flags;
 
 	if (!device_is_ready(config->clock_dev)) {
 		LOG_ERR("clock control device not ready");
@@ -178,14 +197,9 @@ static int wdt_esp32_init(const struct device *dev)
 
 	wdt_hal_init(&data->hal, config->wdt_inst, MWDT_TICK_PRESCALER, true);
 
-	flags = ESP_PRIO_TO_FLAGS(config->irq_priority) | ESP_INT_FLAGS_CHECK(config->irq_flags);
-	ret = esp_intr_alloc(config->irq_source, flags, (intr_handler_t)wdt_esp32_isr, (void *)dev,
-			     NULL);
-
-	if (ret != 0) {
-		LOG_ERR("could not allocate interrupt (err %d)", ret);
-		return ret;
-	}
+	/* Interrupt (needed only for a callback-driven watchdog) is allocated
+	 * lazily in wdt_esp32_install_timeout(), once it's known whether a
+	 * callback was actually requested. */
 
 #ifndef CONFIG_WDT_DISABLE_AT_BOOT
 	wdt_esp32_enable(dev);
