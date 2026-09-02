@@ -35,7 +35,13 @@ LOG_MODULE_REGISTER(sdhc_spi, CONFIG_SDHC_LOG_LEVEL);
 
 #if ANY_INST_REQUIRES_EXPLICIT_FF
 
-static const uint8_t sdhc_ones[] = {
+/* Not const: this is handed to the SPI driver as a TX buffer, and on targets
+ * that transmit it by DMA (ESP32-S3 GDMA) a .rodata placement is an XIP-flash
+ * address no DMA engine can read — the transfer is rejected with -EINVAL and
+ * the card sees a truncated read.  Keeping it in RAM makes every SD transfer
+ * DMA-eligible instead of depending on the bus driver to allocate and copy a
+ * 512-byte bounce buffer per transfer.  4-byte aligned for the same reason. */
+static uint8_t sdhc_ones[] __aligned(4) = {
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
