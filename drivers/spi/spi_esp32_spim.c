@@ -264,11 +264,18 @@ static void IRAM_ATTR spi_esp32_isr(void *arg)
 	const struct spi_esp32_config *cfg = dev->config;
 	struct spi_esp32_data *data = dev->data;
 
+	int ret;
+
 	do {
-		spi_esp32_transfer(dev);
+		ret = spi_esp32_transfer(dev);
+		if (ret) {
+			/* Same as the polled path: a failed setup leaves the context
+			 * untouched, so retrying it here would spin the ISR forever. */
+			break;
+		}
 	} while (spi_esp32_transfer_ongoing(data));
 
-	spi_esp32_complete(dev, data, cfg->spi, 0);
+	spi_esp32_complete(dev, data, cfg->spi, ret);
 }
 #endif
 
@@ -507,7 +514,33 @@ static int IRAM_ATTR spi_esp32_configure(const struct device *dev,
 	defined(CONFIG_SOC_SERIES_ESP32C3) || defined(CONFIG_SOC_SERIES_ESP32C6)) &&               \
 	!defined(DT_SPI_CTX_HAS_NO_CS_GPIOS)
 	if ((ctx->num_cs_gpios != 0) && (hal_dev->mode & (SPI_MODE_CPOL | SPI_MODE_CPHA))) {
+		/* transceive() has already installed the caller's buffers, and CS is
+		 * not asserted until it returns, so an unguarded transfer here clocks
+		 * the first chunk of the caller's payload out to nobody and consumes
+		 * it from the context — the peripheral never receives those bytes and
+		 * the caller is still told the transfer succeeded.  On a bus shared by
+		 * several devices this reconfigure runs on nearly every transaction.
+		 * Snapshot the buffer tracking so the dummy only costs the clock burst
+		 * it exists for, and the payload is transmitted intact afterwards. */
+		const struct spi_buf *saved_current_tx = ctx->current_tx;
+		const struct spi_buf *saved_current_rx = ctx->current_rx;
+		size_t saved_tx_count = ctx->tx_count;
+		size_t saved_rx_count = ctx->rx_count;
+		const uint8_t *saved_tx_buf = ctx->tx_buf;
+		uint8_t *saved_rx_buf = ctx->rx_buf;
+		size_t saved_tx_len = ctx->tx_len;
+		size_t saved_rx_len = ctx->rx_len;
+
 		spi_esp32_transfer(dev);
+
+		ctx->current_tx = saved_current_tx;
+		ctx->current_rx = saved_current_rx;
+		ctx->tx_count = saved_tx_count;
+		ctx->rx_count = saved_rx_count;
+		ctx->tx_buf = saved_tx_buf;
+		ctx->rx_buf = saved_rx_buf;
+		ctx->tx_len = saved_tx_len;
+		ctx->rx_len = saved_rx_len;
 	}
 #endif
 
@@ -564,14 +597,31 @@ static int transceive(const struct device *dev,
 	spi_ll_enable_int(cfg->spi);
 	spi_ll_set_int_stat(cfg->spi);
 
+	/* The ISR drives the transfer and signals ctx->sync when the last chunk
+	 * is done.  Without this wait transceive() returns while the transfer is
+	 * still in flight: the caller reads an rx buffer the DMA has not filled
+	 * yet, and its next call runs spi_context_buffers_setup() underneath the
+	 * still-running ISR — which is how a buffer pointer can change between
+	 * the ISR's DMA-capability check and the moment it arms the descriptor.
+	 * spi_context_complete() already posts the semaphore; nothing took it. */
 	ret = spi_context_wait_for_completion(&data->ctx);
 #else
 
 	do {
-		spi_esp32_transfer(dev);
+		ret = spi_esp32_transfer(dev);
+		if (ret) {
+			/* A transfer that fails during setup (DMA arming, bounce
+			 * buffer allocation) returns before spi_context_update_tx/rx,
+			 * so the context is unchanged and transfer_ongoing() is still
+			 * true: looping would retry the identical failure forever.
+			 * Report it instead of clocking the bus with nothing armed,
+			 * which reaches the peripheral as protocol corruption rather
+			 * than as the setup error it is. */
+			break;
+		}
 	} while (spi_esp32_transfer_ongoing(data));
 
-	spi_esp32_complete(dev, data, cfg->spi, 0);
+	spi_esp32_complete(dev, data, cfg->spi, ret);
 
 #endif  /* CONFIG_SPI_ESP32_INTERRUPT */
 

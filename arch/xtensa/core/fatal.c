@@ -14,6 +14,7 @@
 #include <xtensa_internal.h>
 
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 LOG_MODULE_DECLARE(os, CONFIG_KERNEL_LOG_LEVEL);
 
 #if defined(CONFIG_SIMULATOR_XTENSA) || defined(XT_SIMULATOR)
@@ -86,6 +87,24 @@ char *xtensa_exccause(unsigned int cause_code)
 
 void xtensa_fatal_error(unsigned int reason, const struct arch_esf *esf)
 {
+	/* Enter log panic mode *before* dumping anything.
+	 *
+	 * With CONFIG_LOG_MODE_DEFERRED, the LOG_ERR lines below are queued for
+	 * the log processing thread, which formats them on its own stack.  That
+	 * stack defaults to 1024 bytes on Xtensa (LOG_PROCESS_THREAD_STACK_SIZE)
+	 * and cbprintf plus windowed-ABI register spills overflow it partway
+	 * through a register dump -- so the panic that actually matters is
+	 * replaced by a second, useless "stack overflow in thread: logging".
+	 * On SMP that second fault lands on the other CPU and interleaves with
+	 * this one, shredding both reports.
+	 *
+	 * z_fatal_error() already calls LOG_PANIC(); doing it here as well just
+	 * moves the switch ahead of xtensa_dump_stack() so the whole dump is
+	 * formatted synchronously, in-place, on the panicking thread.  The board
+	 * cannot afford the DRAM to grow the logging stack instead.
+	 */
+	LOG_PANIC();
+
 #ifdef CONFIG_EXCEPTION_DEBUG
 	if (esf != NULL) {
 		/* Don't want to get elbowed by xtensa_switch
