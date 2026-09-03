@@ -1,0 +1,21 @@
+# Copyright (c) 2026 AkiraOS Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config USBH_MASS_STORAGE_CLASS
+	bool "USB host Mass Storage class (Bulk-Only Transport + SCSI)"
+	help
+	  Enable the USB host Mass Storage class driver. Speaks Bulk-Only
+	  Transport and a minimal SCSI command set (TEST UNIT READY, READ
+	  CAPACITY(10), READ(10), WRITE(10)) to a connected USB mass-storage
+	  device (e.g. a flash drive) and exposes it as a disk_access disk
+	  named "USB".
+
+if USBH_MASS_STORAGE_CLASS
+
+config USBH_MASS_STORAGE_CLASS_LOG_LEVEL
+	int "Log level for USB host MSC class"
+	default 3
+	range 0 4
+
+endif # USBH_MASS_STORAGE_CLASS
