@@ -28,7 +28,7 @@
 const void *usbh_desc_get_next(const void *const desc);
 
 /**
- * @brief Search an interface descriptor matching the interace number wanted.
+ * @brief Search an interface descriptor matching the interface number wanted.
  *
  * The descriptors following it can be browsed using @ref usbh_desc_get_next
  *
@@ -52,7 +52,7 @@ const void *usbh_desc_get_iface(const struct usb_device *const udev, const uint8
 const void *usbh_desc_get_endpoint(const struct usb_device *const udev, const uint8_t ep);
 
 /**
- * @brief Search an interface association descriptor matching the interace number wanted.
+ * @brief Search an interface association descriptor matching the interface number wanted.
  *
  * The descriptors are going to be scanned until either an interface association
  * @c bFirstInterface field or an interface @c bInterfaceNumber field match.
@@ -89,8 +89,7 @@ int usbh_desc_fill_filter(const struct usb_desc_header *desc,
  * @return true if the descriptor size and type are correct
  * @return false if the descriptor size or type is wrong
  */
-const bool usbh_desc_is_valid(const void *const desc,
-			      const size_t size, const uint8_t type);
+bool usbh_desc_is_valid(const void *const desc, const size_t size, const uint8_t type);
 
 /**
  * @brief Checks that the pointed descriptor is an interface descriptor.
