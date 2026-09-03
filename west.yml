@@ -169,7 +169,8 @@ manifest:
       groups:
         - hal
     - name: hal_espressif
-      revision: af6cfa2e3e7098b596062ab516b80a48a7ba7332
+      url: https://github.com/PenEngineering/hal_espressif
+      revision: 8d43b019da2e12d728a48f4de611347672d2608d
       path: modules/hal/espressif
       west-commands: west/west-commands.yml
       groups:
