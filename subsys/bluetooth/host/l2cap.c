@@ -722,23 +722,27 @@ static void raise_data_ready(struct bt_l2cap_le_chan *le_chan)
 {
 	__maybe_unused bool added;
 
-	/* This function is the only function which accesses l2cap_data_ready list that can be
-	 * called from a preemptive thread context, therefore requires a critical section to ensure
-	 * that the data ready list is not modified while we are checking and appending to it.
+	/* l2cap_data_ready_lock (declared in conn_internal.h, defined in
+	 * conn.c) replaces a k_sched_lock()-based critical section that gave
+	 * no cross-core exclusion under CONFIG_SMP. Released before calling
+	 * bt_conn_data_ready() below, which takes its own (different) lock —
+	 * never hold both at once.
 	 */
-	k_sched_lock();
+	{
+		k_spinlock_key_t key = k_spin_lock(&l2cap_data_ready_lock);
 
-	if (!sys_slist_find(&le_chan->chan.conn->l2cap_data_ready,
-				 &le_chan->_pdu_ready, NULL)) {
-		sys_slist_append(&le_chan->chan.conn->l2cap_data_ready,
-				 &le_chan->_pdu_ready);
+		if (!sys_slist_find(&le_chan->chan.conn->l2cap_data_ready,
+					 &le_chan->_pdu_ready, NULL)) {
+			sys_slist_append(&le_chan->chan.conn->l2cap_data_ready,
+					 &le_chan->_pdu_ready);
 
-		added = true;
-	} else {
-		added = false;
+			added = true;
+		} else {
+			added = false;
+		}
+
+		k_spin_unlock(&l2cap_data_ready_lock, key);
 	}
-
-	k_sched_unlock();
 
 	LOG_DBG("L2CAP channel %p data ready %s", le_chan, added ? "added" : "already added");
 
@@ -748,7 +752,12 @@ static void raise_data_ready(struct bt_l2cap_le_chan *le_chan)
 static void lower_data_ready(struct bt_l2cap_le_chan *le_chan)
 {
 	struct bt_conn *conn = le_chan->chan.conn;
-	__maybe_unused sys_snode_t *s = sys_slist_get(&conn->l2cap_data_ready);
+	__maybe_unused sys_snode_t *s;
+	k_spinlock_key_t key = k_spin_lock(&l2cap_data_ready_lock);
+
+	s = sys_slist_get(&conn->l2cap_data_ready);
+
+	k_spin_unlock(&l2cap_data_ready_lock, key);
 
 	LOG_DBG("%p", le_chan);
 
@@ -761,16 +770,14 @@ static void cancel_data_ready(struct bt_l2cap_le_chan *le_chan)
 
 	LOG_DBG("%p", le_chan);
 
-	/* Use critical section here as this function can be called from
-	 * a preemptive thread context and we need to ensure that the data ready list is not
-	 * modified while we are removing the channel from it.
-	 */
-	k_sched_lock();
+	{
+		k_spinlock_key_t key = k_spin_lock(&l2cap_data_ready_lock);
 
-	sys_slist_find_and_remove(&conn->l2cap_data_ready,
-				  &le_chan->_pdu_ready);
+		sys_slist_find_and_remove(&conn->l2cap_data_ready,
+					  &le_chan->_pdu_ready);
 
-	k_sched_unlock();
+		k_spin_unlock(&l2cap_data_ready_lock, key);
+	}
 }
 
 int bt_l2cap_send_pdu(struct bt_l2cap_le_chan *le_chan, struct net_buf *pdu,

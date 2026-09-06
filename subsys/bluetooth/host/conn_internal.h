@@ -207,6 +207,9 @@ struct bt_conn_rx {
 	uint16_t handle;
 };
 
+/* See the l2cap_data_ready field comment below. Defined in conn.c. */
+extern struct k_spinlock l2cap_data_ready_lock;
+
 struct bt_conn {
 	uint16_t			handle;
 	enum bt_conn_type	type;
@@ -314,6 +317,11 @@ struct bt_conn {
 	/* For ACL: List of data-ready L2 channels. Used by TX processor for
 	 * pulling HCI fragments. Channels are only ever removed from this list
 	 * when a whole PDU (ie all its frags) have been sent.
+	 *
+	 * All sys_slist_* touches of l2cap_data_ready (across conn.c and
+	 * l2cap.c) must hold l2cap_data_ready_lock (defined in conn.c) — it
+	 * replaces a k_sched_lock()-based critical section that gave no
+	 * cross-core exclusion under CONFIG_SMP.
 	 */
 	sys_slist_t		l2cap_data_ready;
 

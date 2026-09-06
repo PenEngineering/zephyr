@@ -93,6 +93,20 @@ static sys_slist_t callback_list = SYS_SLIST_STATIC_INIT(&callback_list);
 
 #if defined(CONFIG_BT_GATT_DYNAMIC_DB)
 static sys_slist_t db;
+/*
+ * Guards `db`'s register/unregister/is_registered list mutation — replaces a
+ * k_sched_lock()-based critical section with no cross-core exclusion under
+ * CONFIG_SMP. Scoped to just the sys_slist_* touch in each of those three
+ * functions; NOT held across sc_indicate()/db_changed() (deep call chains we
+ * haven't audited for lock ordering) or across the dynamic-db attribute
+ * iteration used by live GATT read/write processing (foreach_attr_type_dyndb)
+ * — that hot, callback-heavy path was already unlocked even in the original
+ * single-core code (services are expected to be registered before traffic
+ * flows), so this fix doesn't newly regress or newly protect it, just
+ * restores the same protection level the register/unregister path already
+ * had on UP, correctly, under SMP.
+ */
+static struct k_spinlock gatt_db_lock;
 #endif /* CONFIG_BT_GATT_DYNAMIC_DB */
 
 enum gatt_global_flags {
@@ -1751,17 +1765,19 @@ int bt_gatt_service_register(struct bt_gatt_service *svc)
 		return -EALREADY;
 	}
 
-	k_sched_lock();
+	{
+		k_spinlock_key_t key = k_spin_lock(&gatt_db_lock);
 
-	err = gatt_register(svc);
+		err = gatt_register(svc);
+
+		k_spin_unlock(&gatt_db_lock, key);
+	}
 	if (err < 0) {
-		k_sched_unlock();
 		return err;
 	}
 
 	/* Don't submit any work until the stack is initialized */
 	if (!atomic_test_bit(gatt_flags, GATT_INITIALIZED)) {
-		k_sched_unlock();
 		return 0;
 	}
 
@@ -1769,8 +1785,6 @@ int bt_gatt_service_register(struct bt_gatt_service *svc)
 		    svc->attrs[svc->attr_count - 1].handle);
 
 	db_changed();
-
-	k_sched_unlock();
 
 	return 0;
 }
@@ -1789,25 +1803,25 @@ int bt_gatt_service_unregister(struct bt_gatt_service *svc)
 	sc_start_handle = svc->attrs[0].handle;
 	sc_end_handle = svc->attrs[svc->attr_count - 1].handle;
 
-	k_sched_lock();
+	{
+		k_spinlock_key_t key = k_spin_lock(&gatt_db_lock);
 
-	err = gatt_unregister(svc);
+		err = gatt_unregister(svc);
+
+		k_spin_unlock(&gatt_db_lock, key);
+	}
 	if (err) {
-		k_sched_unlock();
 		return err;
 	}
 
 	/* Don't submit any work until the stack is initialized */
 	if (!atomic_test_bit(gatt_flags, GATT_INITIALIZED)) {
-		k_sched_unlock();
 		return 0;
 	}
 
 	sc_indicate(sc_start_handle, sc_end_handle);
 
 	db_changed();
-
-	k_sched_unlock();
 
 	return 0;
 }
@@ -1817,15 +1831,18 @@ bool bt_gatt_service_is_registered(const struct bt_gatt_service *svc)
 	bool registered = false;
 	sys_snode_t *node;
 
-	k_sched_lock();
-	SYS_SLIST_FOR_EACH_NODE(&db, node) {
-		if (&svc->node == node) {
-			registered = true;
-			break;
-		}
-	}
+	{
+		k_spinlock_key_t key = k_spin_lock(&gatt_db_lock);
 
-	k_sched_unlock();
+		SYS_SLIST_FOR_EACH_NODE(&db, node) {
+			if (&svc->node == node) {
+				registered = true;
+				break;
+			}
+		}
+
+		k_spin_unlock(&gatt_db_lock, key);
+	}
 
 	return registered;
 }
@@ -5661,15 +5678,14 @@ void bt_gatt_cancel(struct bt_conn *conn, void *params)
 	struct bt_att_req *req;
 	bt_att_func_t func = NULL;
 
-	k_sched_lock();
-
+	/* bt_att_find_req_by_user_data()/bt_att_req_cancel() now take
+	 * att_reqs_lock internally — no outer lock needed here.
+	 */
 	req = bt_att_find_req_by_user_data(conn, params);
 	if (req) {
 		func = req->func;
 		bt_att_req_cancel(conn, req);
 	}
-
-	k_sched_unlock();
 
 	if (func) {
 		func(conn, BT_ATT_ERR_UNLIKELY, NULL, 0, params);

@@ -4427,14 +4427,24 @@ static int bt_recv_unsafe(struct net_buf *buf)
 	}
 }
 
+/*
+ * Serializes entry into bt_recv_unsafe() (per its name, not reentrant) across
+ * cores. This is a leaf lock — nothing else acquires it — so it can't
+ * deadlock against conn_ready_lock/l2cap_data_ready_lock/att_reqs_lock/
+ * gatt_db_lock even though bt_recv_unsafe() may transitively touch state
+ * guarded by those.
+ */
+static struct k_spinlock hci_recv_lock;
+
 int bt_hci_recv(const struct device *dev, struct net_buf *buf)
 {
 	ARG_UNUSED(dev);
 	int err;
+	k_spinlock_key_t key = k_spin_lock(&hci_recv_lock);
 
-	k_sched_lock();
 	err = bt_recv_unsafe(buf);
-	k_sched_unlock();
+
+	k_spin_unlock(&hci_recv_lock, key);
 
 	return err;
 }

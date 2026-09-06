@@ -65,6 +65,30 @@ LOG_MODULE_REGISTER(bt_conn);
 
 K_FIFO_DEFINE(free_tx);
 
+/*
+ * bt_dev.le.conn_ready has a single consumer (get_conn_ready(), always
+ * called from the TX processor workqueue) but multiple potential producers
+ * (bt_conn_data_ready(), callable from any thread) — the append-vs-remove
+ * race needs real cross-core exclusion under CONFIG_SMP, which k_sched_lock()
+ * cannot provide (it only blocks preemption on the calling core). This
+ * spinlock is held only around the actual
+ * sys_slist_* mutation (append in bt_conn_data_ready(), remove in
+ * get_conn_ready()) — never across the nested bt_conn_data_ready() call that
+ * get_conn_ready() makes on its own remove path, which would self-deadlock a
+ * non-recursive spinlock.
+ */
+static struct k_spinlock conn_ready_lock;
+
+/*
+ * Guards conn->l2cap_data_ready across conn.c and l2cap.c (see the field's
+ * comment in conn_internal.h). Consumer side (get_ready_chan/lower_data_ready
+ * in l2cap.c) runs solely on the TX processor workqueue, same as
+ * get_conn_ready() above; producer side (raise_data_ready in l2cap.c) can be
+ * called from any thread. Non-static: shared with l2cap.c via the extern in
+ * conn_internal.h.
+ */
+struct k_spinlock l2cap_data_ready_lock;
+
 #if defined(CONFIG_BT_CONN_TX_NOTIFY_WQ)
 static struct k_work_q conn_tx_workq;
 static K_KERNEL_STACK_DEFINE(conn_tx_workq_thread_stack, CONFIG_BT_CONN_TX_NOTIFY_WQ_STACK_SIZE);
@@ -811,7 +835,14 @@ void bt_conn_cleanup_all(void)
 /* Returns true if L2CAP has data to send on this conn */
 static bool acl_has_data(struct bt_conn *conn)
 {
-	return sys_slist_peek_head(&conn->l2cap_data_ready) != NULL;
+	bool has_data;
+	k_spinlock_key_t key = k_spin_lock(&l2cap_data_ready_lock);
+
+	has_data = sys_slist_peek_head(&conn->l2cap_data_ready) != NULL;
+
+	k_spin_unlock(&l2cap_data_ready_lock, key);
+
+	return has_data;
 }
 #endif	/* defined(CONFIG_BT_CONN) */
 
@@ -865,21 +896,22 @@ void bt_conn_data_ready(struct bt_conn *conn)
 
 	bt_conn_ref(conn);
 
-	/* This function is the only function which accesses conn_ready list  that can be called
-	 * from a preemptive thread context, therefore requires a critical section to ensure that
-	 * the conn_ready list is not modified while we are checking and appending to it.
+	/* conn_ready_lock (see its declaration) makes this append and
+	 * get_conn_ready()'s remove mutually exclusive across cores.
 	 */
-	k_sched_lock();
+	{
+		k_spinlock_key_t key = k_spin_lock(&conn_ready_lock);
 
-	if (!sys_slist_find(&bt_dev.le.conn_ready, &conn->_conn_ready, NULL)) {
-		sys_slist_append(&bt_dev.le.conn_ready, &conn->_conn_ready);
+		if (!sys_slist_find(&bt_dev.le.conn_ready, &conn->_conn_ready, NULL)) {
+			sys_slist_append(&bt_dev.le.conn_ready, &conn->_conn_ready);
 
-		added = true;
-	} else {
-		added = false;
+			added = true;
+		} else {
+			added = false;
+		}
+
+		k_spin_unlock(&conn_ready_lock, key);
 	}
-
-	k_sched_unlock();
 
 	if (!added) {
 		bt_conn_unref(conn);
@@ -964,9 +996,22 @@ static struct bt_conn *get_conn_ready(void)
 		}
 
 		if (should_stop_tx(conn)) {
-			/* Move reference off the list */
+			/* Move reference off the list. get_conn_ready() is the sole
+			 * consumer (always run from the TX processor workqueue), so
+			 * this traversal itself doesn't race itself; conn_ready_lock
+			 * only needs to cover this remove, which can race a
+			 * concurrent append in bt_conn_data_ready() on another core.
+			 * Released before the nested bt_conn_data_ready() call below
+			 * (same lock, would self-deadlock if still held).
+			 */
 			__ASSERT_NO_MSG(prev != &conn->_conn_ready);
-			sys_slist_remove(&bt_dev.le.conn_ready, prev, &conn->_conn_ready);
+			{
+				k_spinlock_key_t key = k_spin_lock(&conn_ready_lock);
+
+				sys_slist_remove(&bt_dev.le.conn_ready, prev, &conn->_conn_ready);
+
+				k_spin_unlock(&conn_ready_lock, key);
+			}
 
 			/* Append connection to list if it is connected and still has data */
 			if (conn->has_data(conn) && (conn->state == BT_CONN_CONNECTED)) {

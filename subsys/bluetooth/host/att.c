@@ -46,6 +46,29 @@
 #define LOG_LEVEL CONFIG_BT_ATT_LOG_LEVEL
 LOG_MODULE_REGISTER(bt_att);
 
+/*
+ * Guards struct bt_att's `reqs` list. Both producer (bt_att_req_send, called
+ * from app/GATT threads submitting a new request) and consumer (att_sent /
+ * att_req_send_process, driven by the L2CAP "sent" callback and by
+ * bt_att_req_send itself when nothing is in flight) sides can run on
+ * different cores under CONFIG_SMP; this replaces the k_sched_lock()-based
+ * critical sections that only protected against same-core preemption. Held
+ * only around the actual sys_slist_* touch — never across a call to
+ * bt_att_chan_req_send()/att_req_send_process(), which go on to touch other
+ * locked state (e.g. l2cap_data_ready_lock via the L2CAP send path).
+ */
+static struct k_spinlock att_reqs_lock;
+
+/*
+ * Guards a channel's chan.rx.mtu/chan.tx.mtu pair against a concurrent MTU
+ * Exchange req/rsp update (processed on the HCI RX path) while a sender on
+ * another core reads bt_att_mtu(chan) right after a send — same
+ * k_sched_lock()-under-SMP gap as att_reqs_lock above. NOT needed at initial
+ * channel setup (bt_att_accept et al.): the channel isn't reachable by any
+ * other thread yet at that point.
+ */
+static struct k_spinlock att_mtu_lock;
+
 #define ATT_CHAN(_ch) CONTAINER_OF(_ch, struct bt_att_chan, chan.chan)
 #define ATT_REQ(_node) CONTAINER_OF(_node, struct bt_att_req, node)
 
@@ -550,19 +573,29 @@ static int bt_att_chan_req_send(struct bt_att_chan *chan, struct bt_att_req *req
 	buf = req->buf;
 	req->buf = NULL;
 
-	/* This lock makes sure the value of `bt_att_mtu(chan)` does not
-	 * change.
-	 */
-	k_sched_lock();
 	err = bt_att_chan_send(chan, buf);
 	if (err) {
 		/* We still have the ownership of the buffer */
 		req->buf = buf;
 		chan->req = NULL;
 	} else {
-		bt_gatt_req_set_mtu(req, bt_att_mtu(chan));
+		/* att_mtu_lock makes the two-field (rx.mtu, tx.mtu) read
+		 * consistent against a concurrent MTU exchange response being
+		 * processed on the HCI RX path (see att_mtu_lock's comment).
+		 * Deliberately NOT held across bt_att_chan_send() above (an L2CAP
+		 * send whose full call depth we haven't verified for lock
+		 * ordering against att_mtu_lock) — a rename right after this send
+		 * returns is an extremely narrow, benign race (this request's
+		 * recorded MTU is at most one exchange stale), not a data race on
+		 * the mtu fields themselves.
+		 */
+		k_spinlock_key_t key = k_spin_lock(&att_mtu_lock);
+		uint16_t mtu = bt_att_mtu(chan);
+
+		k_spin_unlock(&att_mtu_lock, key);
+
+		bt_gatt_req_set_mtu(req, mtu);
 	}
-	k_sched_unlock();
 
 	return err;
 }
@@ -587,16 +620,25 @@ static void bt_att_sent(struct bt_l2cap_chan *ch)
 	 * processed before they may always contain a buffer starving the
 	 * request queue.
 	 */
-	if (!chan->req && !sys_slist_is_empty(&att->reqs)) {
-		sys_snode_t *node = sys_slist_get(&att->reqs);
+	if (!chan->req) {
+		sys_snode_t *node;
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
 
-		err = bt_att_chan_req_send(chan, ATT_REQ(node));
-		if (err == 0) {
-			return;
+		node = sys_slist_get(&att->reqs);
+
+		k_spin_unlock(&att_reqs_lock, key);
+
+		if (node) {
+			err = bt_att_chan_req_send(chan, ATT_REQ(node));
+			if (err == 0) {
+				return;
+			}
+
+			/* Prepend back to the list as it could not be sent */
+			key = k_spin_lock(&att_reqs_lock);
+			sys_slist_prepend(&att->reqs, node);
+			k_spin_unlock(&att_reqs_lock, key);
 		}
-
-		/* Prepend back to the list as it could not be sent */
-		sys_slist_prepend(&att->reqs, node);
 	}
 
 	/* Process channel queue */
@@ -880,8 +922,14 @@ static uint8_t att_mtu_req(struct bt_att_chan *chan, struct net_buf *buf)
 	/* The ATT_EXCHANGE_MTU_REQ/RSP is just an alternative way of
 	 * communicating the L2CAP MTU.
 	 */
-	chan->chan.rx.mtu = mtu_server;
-	chan->chan.tx.mtu = mtu_client;
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_mtu_lock);
+
+		chan->chan.rx.mtu = mtu_server;
+		chan->chan.tx.mtu = mtu_client;
+
+		k_spin_unlock(&att_mtu_lock, key);
+	}
 
 	LOG_DBG("Negotiated MTU %u", bt_att_mtu(chan));
 
@@ -921,8 +969,18 @@ static void att_req_send_process(struct bt_att *att)
 
 		prev = chan;
 
-		/* Pull next request from the list */
-		req = get_first_req_matching_chan(&att->reqs, chan);
+		/* Pull next request from the list. att_reqs_lock covers the
+		 * find-and-remove inside get_first_req_matching_chan(); it must
+		 * not be held across bt_att_chan_req_send() below, which goes on
+		 * to touch other locked state (e.g. l2cap_data_ready_lock).
+		 */
+		{
+			k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
+
+			req = get_first_req_matching_chan(&att->reqs, chan);
+
+			k_spin_unlock(&att_reqs_lock, key);
+		}
 		if (!req) {
 			continue;
 		}
@@ -932,7 +990,13 @@ static void att_req_send_process(struct bt_att *att)
 		}
 
 		/* Prepend back to the list as it could not be sent */
-		sys_slist_prepend(&att->reqs, &req->node);
+		{
+			k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
+
+			sys_slist_prepend(&att->reqs, &req->node);
+
+			k_spin_unlock(&att_reqs_lock, key);
+		}
 	}
 }
 
@@ -998,12 +1062,17 @@ static uint8_t att_mtu_rsp(struct bt_att_chan *chan, struct net_buf *buf)
 	/* The following must equal the value we sent in the req. We assume this
 	 * is a rsp to `gatt_exchange_mtu_encode`.
 	 */
-	chan->chan.rx.mtu = BT_LOCAL_ATT_MTU_UATT;
 	/* The ATT_EXCHANGE_MTU_REQ/RSP is just an alternative way of
 	 * communicating the L2CAP MTU.
 	 */
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_mtu_lock);
 
-	chan->chan.tx.mtu = mtu;
+		chan->chan.rx.mtu = BT_LOCAL_ATT_MTU_UATT;
+		chan->chan.tx.mtu = mtu;
+
+		k_spin_unlock(&att_mtu_lock, key);
+	}
 
 	LOG_DBG("Negotiated MTU %u", bt_att_mtu(chan));
 
@@ -3076,12 +3145,23 @@ static void att_reset(struct bt_att *att)
 		net_buf_unref(buf);
 	}
 
-	/* Notify pending requests */
-	while (!sys_slist_is_empty(&att->reqs)) {
+	/* Notify pending requests. Pop under att_reqs_lock, but call req->func
+	 * (an arbitrary completion callback) after unlocking — never hold a
+	 * spinlock across it.
+	 */
+	for (;;) {
 		struct bt_att_req *req;
 		sys_snode_t *node;
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
 
-		node = sys_slist_get_not_empty(&att->reqs);
+		node = sys_slist_get(&att->reqs);
+
+		k_spin_unlock(&att_reqs_lock, key);
+
+		if (!node) {
+			break;
+		}
+
 		req = CONTAINER_OF(node, struct bt_att_req, node);
 		if (req->func) {
 			req->func(att->conn, -ECONNRESET, NULL, 0,
@@ -3315,7 +3395,13 @@ static void bt_att_status(struct bt_l2cap_chan *ch, atomic_t *status)
 	}
 
 	/* Pull next request from the list */
-	node = sys_slist_get(&chan->att->reqs);
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
+
+		node = sys_slist_get(&chan->att->reqs);
+
+		k_spin_unlock(&att_reqs_lock, key);
+	}
 	if (!node) {
 		return;
 	}
@@ -3325,7 +3411,13 @@ static void bt_att_status(struct bt_l2cap_chan *ch, atomic_t *status)
 	}
 
 	/* Prepend back to the list as it could not be sent */
-	sys_slist_prepend(&chan->att->reqs, node);
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
+
+		sys_slist_prepend(&chan->att->reqs, node);
+
+		k_spin_unlock(&att_reqs_lock, key);
+	}
 }
 
 static void bt_att_released(struct bt_l2cap_chan *ch)
@@ -3973,18 +4065,22 @@ int bt_att_req_send(struct bt_conn *conn, struct bt_att_req *req)
 	__ASSERT_NO_MSG(conn);
 	__ASSERT_NO_MSG(req);
 
-	k_sched_lock();
-
 	att = att_get(conn);
 	if (!att) {
-		k_sched_unlock();
 		return -ENOTCONN;
 	}
 
-	sys_slist_append(&att->reqs, &req->node);
-	att_req_send_process(att);
+	/* att_req_send_process() takes att_reqs_lock itself — must not still
+	 * be held here when we call it, or it self-deadlocks.
+	 */
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
 
-	k_sched_unlock();
+		sys_slist_append(&att->reqs, &req->node);
+
+		k_spin_unlock(&att_reqs_lock, key);
+	}
+	att_req_send_process(att);
 
 	return 0;
 }
@@ -4027,7 +4123,13 @@ void bt_att_req_cancel(struct bt_conn *conn, struct bt_att_req *req)
 	}
 
 	/* Remove request from the list */
-	sys_slist_find_and_remove(&att->reqs, &req->node);
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
+
+		sys_slist_find_and_remove(&att->reqs, &req->node);
+
+		k_spin_unlock(&att_reqs_lock, key);
+	}
 
 	bt_att_req_free(req);
 }
@@ -4049,10 +4151,17 @@ struct bt_att_req *bt_att_find_req_by_user_data(struct bt_conn *conn, const void
 		}
 	}
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&att->reqs, req, node) {
-		if (req->user_data == user_data) {
-			return req;
+	{
+		k_spinlock_key_t key = k_spin_lock(&att_reqs_lock);
+
+		SYS_SLIST_FOR_EACH_CONTAINER(&att->reqs, req, node) {
+			if (req->user_data == user_data) {
+				k_spin_unlock(&att_reqs_lock, key);
+				return req;
+			}
 		}
+
+		k_spin_unlock(&att_reqs_lock, key);
 	}
 
 	return NULL;

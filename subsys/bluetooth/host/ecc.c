@@ -37,6 +37,20 @@ static uint8_t pub_key[BT_PUB_KEY_LEN];
 static sys_slist_t pub_key_cb_slist;
 static bt_dh_key_cb_t dh_key_cb;
 
+/*
+ * pub_key_cb_slist / dh_key_cb / the PENDING_PUB_KEY|PENDING_DHKEY bits in
+ * `flags` need real cross-core exclusion under CONFIG_SMP, which
+ * k_sched_lock() cannot provide (it only blocks preemption on the calling
+ * core) — registration (bt_pub_key_gen/bt_dh_key_gen, called from arbitrary app/BT
+ * threads) could race the completion callbacks (generate_pub_key/
+ * generate_dh_key/bt_pub_key_hci_disrupted, invoked from the crypto workqueue
+ * or HCI RX path) on a different core. This spinlock makes the actual state
+ * mutation atomic across cores; the callback lists are swapped into a local
+ * copy under the lock and invoked *after* unlocking so we never hold a
+ * spinlock across an arbitrary (app-supplied) callback.
+ */
+static struct k_spinlock ecc_cb_lock;
+
 static void generate_pub_key(struct k_work *work);
 static void generate_dh_key(struct k_work *work);
 K_WORK_DEFINE(pub_key_work, generate_pub_key);
@@ -180,18 +194,19 @@ static void generate_pub_key(struct k_work *work)
 done:
 	atomic_clear_bit(flags, PENDING_PUB_KEY);
 
-	/* Change to cooperative priority while we do the callbacks */
-	k_sched_lock();
+	sys_slist_t cb_slist;
+	k_spinlock_key_t key = k_spin_lock(&ecc_cb_lock);
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&pub_key_cb_slist, cb, node) {
+	cb_slist = pub_key_cb_slist;
+	sys_slist_init(&pub_key_cb_slist);
+
+	k_spin_unlock(&ecc_cb_lock, key);
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&cb_slist, cb, node) {
 		if (cb->func) {
 			cb->func(err ? NULL : pub_key);
 		}
 	}
-
-	sys_slist_init(&pub_key_cb_slist);
-
-	k_sched_unlock();
 }
 
 static void generate_dh_key(struct k_work *work)
@@ -238,26 +253,29 @@ static void generate_dh_key(struct k_work *work)
 	err = 0;
 
 exit:
-	/* Change to cooperative priority while we do the callback */
-	k_sched_lock();
+	{
+		bt_dh_key_cb_t cb = NULL;
+		k_spinlock_key_t key = k_spin_lock(&ecc_cb_lock);
 
-	if (dh_key_cb) {
-		bt_dh_key_cb_t cb = dh_key_cb;
+		if (dh_key_cb) {
+			cb = dh_key_cb;
+			dh_key_cb = NULL;
+			atomic_clear_bit(flags, PENDING_DHKEY);
+		}
 
-		dh_key_cb = NULL;
-		atomic_clear_bit(flags, PENDING_DHKEY);
+		k_spin_unlock(&ecc_cb_lock, key);
 
-		if (err) {
-			cb(NULL);
-		} else {
-			uint8_t dhkey[BT_DH_KEY_LEN];
+		if (cb) {
+			if (err) {
+				cb(NULL);
+			} else {
+				uint8_t dhkey[BT_DH_KEY_LEN];
 
-			sys_memcpy_swap(dhkey, ecc.dhkey_be, sizeof(ecc.dhkey_be));
-			cb(dhkey);
+				sys_memcpy_swap(dhkey, ecc.dhkey_be, sizeof(ecc.dhkey_be));
+				cb(dhkey);
+			}
 		}
 	}
-
-	k_sched_unlock();
 }
 
 int bt_pub_key_gen(struct bt_pub_key_cb *new_cb)
@@ -275,21 +293,33 @@ int bt_pub_key_gen(struct bt_pub_key_cb *new_cb)
 		return -EINVAL;
 	}
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&pub_key_cb_slist, cb, node) {
-		if (cb == new_cb) {
-			LOG_DBG("Callback already registered");
-			return -EALREADY;
+	bool need_submit;
+
+	{
+		k_spinlock_key_t key = k_spin_lock(&ecc_cb_lock);
+
+		SYS_SLIST_FOR_EACH_CONTAINER(&pub_key_cb_slist, cb, node) {
+			if (cb == new_cb) {
+				LOG_DBG("Callback already registered");
+				k_spin_unlock(&ecc_cb_lock, key);
+				return -EALREADY;
+			}
 		}
+
+		if (atomic_test_bit(flags, PENDING_DHKEY)) {
+			LOG_WRN("Busy performing another ECDH operation");
+			k_spin_unlock(&ecc_cb_lock, key);
+			return -EBUSY;
+		}
+
+		sys_slist_prepend(&pub_key_cb_slist, &new_cb->node);
+
+		need_submit = !atomic_test_and_set_bit(flags, PENDING_PUB_KEY);
+
+		k_spin_unlock(&ecc_cb_lock, key);
 	}
 
-	if (atomic_test_bit(flags, PENDING_DHKEY)) {
-		LOG_WRN("Busy performing another ECDH operation");
-		return -EBUSY;
-	}
-
-	sys_slist_prepend(&pub_key_cb_slist, &new_cb->node);
-
-	if (atomic_test_and_set_bit(flags, PENDING_PUB_KEY)) {
+	if (!need_submit) {
 		return 0;
 	}
 
@@ -307,16 +337,20 @@ int bt_pub_key_gen(struct bt_pub_key_cb *new_cb)
 void bt_pub_key_hci_disrupted(void)
 {
 	struct bt_pub_key_cb *cb;
+	sys_slist_t cb_slist;
+	k_spinlock_key_t key = k_spin_lock(&ecc_cb_lock);
 
 	atomic_clear_bit(flags, PENDING_PUB_KEY);
+	cb_slist = pub_key_cb_slist;
+	sys_slist_init(&pub_key_cb_slist);
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&pub_key_cb_slist, cb, node) {
+	k_spin_unlock(&ecc_cb_lock, key);
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&cb_slist, cb, node) {
 		if (cb->func) {
 			cb->func(NULL);
 		}
 	}
-
-	sys_slist_init(&pub_key_cb_slist);
 }
 
 const uint8_t *bt_pub_key_get(void)
@@ -334,21 +368,29 @@ const uint8_t *bt_pub_key_get(void)
 
 int bt_dh_key_gen(const uint8_t remote_pk[BT_PUB_KEY_LEN], bt_dh_key_cb_t cb)
 {
-	if (dh_key_cb == cb) {
-		return -EALREADY;
-	}
-
 	if (!atomic_test_bit(bt_dev.flags, BT_DEV_HAS_PUB_KEY)) {
 		return -EADDRNOTAVAIL;
 	}
 
-	if (dh_key_cb ||
-	    atomic_test_bit(flags, PENDING_PUB_KEY) ||
-	    atomic_test_and_set_bit(flags, PENDING_DHKEY)) {
-		return -EBUSY;
-	}
+	{
+		k_spinlock_key_t key = k_spin_lock(&ecc_cb_lock);
 
-	dh_key_cb = cb;
+		if (dh_key_cb == cb) {
+			k_spin_unlock(&ecc_cb_lock, key);
+			return -EALREADY;
+		}
+
+		if (dh_key_cb ||
+		    atomic_test_bit(flags, PENDING_PUB_KEY) ||
+		    atomic_test_and_set_bit(flags, PENDING_DHKEY)) {
+			k_spin_unlock(&ecc_cb_lock, key);
+			return -EBUSY;
+		}
+
+		dh_key_cb = cb;
+
+		k_spin_unlock(&ecc_cb_lock, key);
+	}
 
 	/* Convert X and Y coordinates from little-endian to
 	 * big-endian (expected by the crypto API).

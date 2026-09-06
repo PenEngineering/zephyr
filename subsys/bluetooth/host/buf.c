@@ -37,16 +37,25 @@ LOG_MODULE_REGISTER(bt_buf, CONFIG_BT_LOG_LEVEL);
 #define SYNC_EVT_SIZE (BT_BUF_RESERVE + BT_HCI_EVT_HDR_SIZE + 255)
 
 static bt_buf_rx_freed_cb_t buf_rx_freed_cb;
+/*
+ * Guards buf_rx_freed_cb — replaces a k_sched_lock()-based critical section
+ * with no cross-core exclusion under CONFIG_SMP. The callback is snapshotted
+ * under the lock and invoked after unlocking, never while holding it.
+ */
+static struct k_spinlock buf_rx_freed_cb_lock;
 
 static void buf_rx_freed_notify(enum bt_buf_type mask)
 {
-	k_sched_lock();
+	bt_buf_rx_freed_cb_t cb;
+	k_spinlock_key_t key = k_spin_lock(&buf_rx_freed_cb_lock);
 
-	if (buf_rx_freed_cb) {
-		buf_rx_freed_cb(mask);
+	cb = buf_rx_freed_cb;
+
+	k_spin_unlock(&buf_rx_freed_cb_lock, key);
+
+	if (cb) {
+		cb(mask);
 	}
-
-	k_sched_unlock();
 }
 
 #if defined(CONFIG_BT_ISO_RX)
@@ -134,15 +143,17 @@ struct net_buf *bt_buf_get_rx(enum bt_buf_type type, k_timeout_t timeout)
 
 void bt_buf_rx_freed_cb_set(bt_buf_rx_freed_cb_t cb)
 {
-	k_sched_lock();
+	{
+		k_spinlock_key_t key = k_spin_lock(&buf_rx_freed_cb_lock);
 
-	buf_rx_freed_cb = cb;
+		buf_rx_freed_cb = cb;
+
+		k_spin_unlock(&buf_rx_freed_cb_lock, key);
+	}
 
 #if defined(CONFIG_BT_ISO_RX)
 	bt_iso_buf_rx_freed_cb_set(cb != NULL ? iso_rx_freed_cb : NULL);
 #endif
-
-	k_sched_unlock();
 }
 
 struct net_buf *bt_buf_get_evt(uint8_t evt, bool discardable,
