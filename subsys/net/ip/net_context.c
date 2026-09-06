@@ -80,7 +80,14 @@ LOG_MODULE_REGISTER(net_ctx, CONFIG_NET_CONTEXT_LOG_LEVEL);
 
 #define NET_MAX_CONTEXT CONFIG_NET_MAX_CONTEXTS
 
-static struct net_context contexts[NET_MAX_CONTEXT];
+/* Moved off internal DRAM onto PSRAM where available: plain socket-context
+ * metadata, only ever touched from thread context (socket API calls, net RX
+ * processing thread) — never from a hardware ISR or DMA descriptor. */
+static struct net_context contexts[NET_MAX_CONTEXT]
+#if defined(CONFIG_SPIRAM)
+	__attribute__((section(".ext_ram.bss"), aligned(4)))
+#endif
+	;
 
 /* We need to lock the contexts array as these APIs are typically called
  * from applications which are usually run in task context.

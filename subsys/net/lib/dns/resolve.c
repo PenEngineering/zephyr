@@ -84,7 +84,13 @@ DNS_CACHE_DEFINE(dns_cache, CONFIG_DNS_RESOLVER_CACHE_MAX_ENTRIES);
 
 static K_MUTEX_DEFINE(lock);
 static int init_called;
-static struct dns_resolve_context dns_default_ctx;
+/* Moved off internal DRAM onto PSRAM where available: plain resolver
+ * context, only ever touched from thread context. */
+static struct dns_resolve_context dns_default_ctx
+#if defined(CONFIG_SPIRAM)
+	__attribute__((section(".ext_ram.bss"), aligned(4)))
+#endif
+	;
 
 /* Must be invoked with context lock held */
 static int dns_write(struct dns_resolve_context *ctx,

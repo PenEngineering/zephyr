@@ -56,7 +56,13 @@ LOG_MODULE_REGISTER(net_conn, CONFIG_NET_CONN_LOG_LEVEL);
 
 #define NET_CONN_RANK(_flags)		(_flags & 0x78)
 
-static struct net_conn conns[CONFIG_NET_MAX_CONN];
+/* Moved off internal DRAM onto PSRAM where available: plain connection
+ * table entries, only ever touched from thread context. */
+static struct net_conn conns[CONFIG_NET_MAX_CONN]
+#if defined(CONFIG_SPIRAM)
+	__attribute__((section(".ext_ram.bss"), aligned(4)))
+#endif
+	;
 
 static sys_slist_t conn_unused;
 static sys_slist_t conn_used;

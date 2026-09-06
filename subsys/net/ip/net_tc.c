@@ -57,7 +57,14 @@ static struct net_traffic_class tx_classes[NET_TC_TX_COUNT];
 #endif
 
 #if NET_TC_RX_COUNT > 0
-static struct net_traffic_class rx_classes[NET_TC_RX_COUNT];
+/* Moved off internal DRAM onto PSRAM where available: this RX thread only
+ * dequeues already-received net_pkts (see the core-pinning comment below) —
+ * never touched from ISR context. */
+static struct net_traffic_class rx_classes[NET_TC_RX_COUNT]
+#if defined(CONFIG_SPIRAM)
+	__attribute__((section(".ext_ram.bss"), aligned(4)))
+#endif
+	;
 #endif
 
 enum net_verdict net_tc_try_submit_to_tx_queue(uint8_t tc, struct net_pkt *pkt,
