@@ -39,6 +39,7 @@ config UHC_NXP_OHCI
 config HEAP_MEM_POOL_ADD_SIZE_UHC_MCUX
 	int "The heap that NXP hal usb host controller drivers need"
 	default 4096
+	depends on UHC_NXP_EHCI || UHC_NXP_KHCI || UHC_NXP_IP3516HS || UHC_NXP_OHCI
 
 config UHC_NXP_THREAD_STACK_SIZE
 	int "MCUX UHC Driver internal thread stack size"
