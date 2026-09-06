@@ -68,7 +68,7 @@ static struct scanner_state scan_state;
 
 #if defined(CONFIG_BT_EXT_ADV)
 /* A buffer used to reassemble advertisement data from the controller. */
-NET_BUF_SIMPLE_DEFINE(ext_scan_buf, CONFIG_BT_EXT_SCAN_BUF_SIZE);
+NET_BUF_SIMPLE_DEFINE_PSRAM(ext_scan_buf, CONFIG_BT_EXT_SCAN_BUF_SIZE);
 
 struct fragmented_advertiser {
 	bt_addr_le_t addr;

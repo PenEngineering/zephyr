@@ -132,7 +132,7 @@ static void deferred_work(struct k_work *work);
 static void notify_connected(struct bt_conn *conn);
 
 static struct bt_conn acl_conns[CONFIG_BT_MAX_CONN];
-NET_BUF_POOL_DEFINE(acl_tx_pool, CONFIG_BT_L2CAP_TX_BUF_COUNT,
+NET_BUF_POOL_DEFINE_PSRAM(acl_tx_pool, CONFIG_BT_L2CAP_TX_BUF_COUNT,
 		    BT_L2CAP_BUF_SIZE(CONFIG_BT_L2CAP_TX_MTU),
 		    CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
@@ -165,7 +165,7 @@ static void frag_destroy(struct net_buf *buf);
 
 /* Storage for fragments (views) into the upper layers' PDUs. */
 /* TODO: remove user-data requirements */
-NET_BUF_POOL_FIXED_DEFINE(fragments, CONFIG_BT_CONN_FRAG_COUNT, 0,
+NET_BUF_POOL_FIXED_DEFINE_PSRAM(fragments, CONFIG_BT_CONN_FRAG_COUNT, 0,
 			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, frag_destroy);
 
 struct frag_md {

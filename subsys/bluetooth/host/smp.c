@@ -289,7 +289,15 @@ struct bt_smp_br {
 static struct bt_smp_br bt_smp_br_pool[CONFIG_BT_MAX_CONN];
 #endif /* CONFIG_BT_CLASSIC */
 
-static struct bt_smp bt_smp_pool[CONFIG_BT_MAX_CONN];
+/* Moved off internal DRAM onto PSRAM where available: per-connection SMP
+ * (pairing) state, only ever touched from thread context. Only used
+ * elsewhere as a plain data array / sentinel pointer value, so relocation
+ * doesn't affect any of that logic. */
+static struct bt_smp bt_smp_pool[CONFIG_BT_MAX_CONN]
+#if defined(CONFIG_SPIRAM)
+	__attribute__((section(".ext_ram.bss"), aligned(4)))
+#endif
+	;
 static bool bondable = IS_ENABLED(CONFIG_BT_BONDABLE);
 static bool sc_oobd_present;
 static bool legacy_oobd_present;

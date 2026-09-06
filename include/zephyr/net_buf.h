@@ -54,6 +54,24 @@ extern "C" {
 		.__buf  = net_buf_data_##_name, \
 	}
 
+/* akiraconsole_prod DRAM-fit: PSRAM-backed variant of the data array only
+ * (the net_buf_simple control struct stays wherever the caller's linkage
+ * puts it, unchanged). Falls back to exactly NET_BUF_SIMPLE_DEFINE when
+ * CONFIG_SPIRAM isn't set. Opt-in only, no existing caller affected. */
+#if defined(CONFIG_SPIRAM)
+#define NET_BUF_SIMPLE_DEFINE_PSRAM(_name, _size)                          \
+	uint8_t net_buf_data_##_name[_size] __attribute__((section(".ext_ram.bss"))); \
+	struct net_buf_simple _name = {         \
+		.data   = net_buf_data_##_name, \
+		.len    = 0,                    \
+		.size   = _size,                \
+		.__buf  = net_buf_data_##_name, \
+	}
+#else
+#define NET_BUF_SIMPLE_DEFINE_PSRAM(_name, _size) \
+	NET_BUF_SIMPLE_DEFINE(_name, _size)
+#endif
+
 /**
  *
  * @brief Define a static net_buf_simple variable.
@@ -1148,6 +1166,39 @@ struct net_buf_pool {
 		     "Size cannot be determined");					       \
 	static struct _net_buf_##_name _net_buf_##_name[_count] __noinit
 
+/* akiraconsole_prod DRAM-fit: PSRAM-backed variant of the bulk storage
+ * arrays only. The struct net_buf_pool descriptor itself (STRUCT_SECTION_ITERABLE)
+ * is deliberately left in internal DRAM unchanged, since that section is
+ * iterated by address across all registered pools system-wide and moving
+ * only some descriptors into a disjoint PSRAM region risks breaking that
+ * iteration. Only the control-block array (_net_buf_##_name, from this
+ * macro) and the data payload array (net_buf_data_##_name, in
+ * NET_BUF_POOL_FIXED_DEFINE_PSRAM below) move — both are plain storage
+ * referenced only via pointers in the (DRAM-resident) descriptor, so their
+ * physical location doesn't affect the iteration mechanism.
+ * Falls back to byte-for-byte the same as _NET_BUF_ARRAY_DEFINE when
+ * CONFIG_SPIRAM isn't set, so this is safe to use unconditionally at a
+ * call site without extra #ifdef guarding there. Opt-in only: no existing
+ * caller of _NET_BUF_ARRAY_DEFINE or NET_BUF_POOL_*_DEFINE is affected. */
+#if defined(CONFIG_SPIRAM)
+#define _NET_BUF_ARRAY_DEFINE_PSRAM(_name, _count, _ud_size)				       \
+	struct _net_buf_##_name { uint8_t b[sizeof(struct net_buf)];			       \
+				  uint8_t ud[_ud_size]; } __net_buf_align;		       \
+	BUILD_ASSERT(_ud_size <= UINT8_MAX);						       \
+	BUILD_ASSERT(offsetof(struct net_buf, user_data) ==				       \
+		     offsetof(struct _net_buf_##_name, ud), "Invalid offset");		       \
+	BUILD_ASSERT(__alignof__(struct net_buf) ==					       \
+		     __alignof__(struct _net_buf_##_name), "Invalid alignment");	       \
+	BUILD_ASSERT(sizeof(struct _net_buf_##_name) ==					       \
+		     ROUND_UP(sizeof(struct net_buf) + _ud_size, __alignof__(struct net_buf)), \
+		     "Size cannot be determined");					       \
+	static struct _net_buf_##_name _net_buf_##_name[_count]			       \
+		__net_buf_align __attribute__((section(".ext_ram.bss")))
+#else
+#define _NET_BUF_ARRAY_DEFINE_PSRAM(_name, _count, _ud_size) \
+	_NET_BUF_ARRAY_DEFINE(_name, _count, _ud_size)
+#endif
+
 extern const struct net_buf_data_alloc net_buf_heap_alloc;
 /** @endcond */
 
@@ -1238,6 +1289,37 @@ extern const struct net_buf_data_cb net_buf_fixed_cb;
 		NET_BUF_POOL_INITIALIZER(_name, &net_buf_fixed_alloc_##_name,  \
 					 _net_buf_##_name, _count, _ud_size,   \
 					 _destroy)
+
+/* akiraconsole_prod DRAM-fit: PSRAM-backed variant — see
+ * _NET_BUF_ARRAY_DEFINE_PSRAM above for what moves and why. The pool
+ * descriptor (STRUCT_SECTION_ITERABLE line) is untouched, identical to the
+ * stock macro, still in internal DRAM. Falls back to exactly
+ * NET_BUF_POOL_FIXED_DEFINE when CONFIG_SPIRAM isn't set. */
+#if defined(CONFIG_SPIRAM)
+#define NET_BUF_POOL_FIXED_DEFINE_PSRAM(_name, _count, _data_size, _ud_size, _destroy) \
+	_NET_BUF_ARRAY_DEFINE_PSRAM(_name, _count, _ud_size);                  \
+	static uint8_t net_buf_data_##_name[_count][_data_size]                \
+		__net_buf_align __attribute__((section(".ext_ram.bss")));      \
+	static const struct net_buf_pool_fixed net_buf_fixed_##_name = {       \
+		.data_pool = (uint8_t *)net_buf_data_##_name,                  \
+	};                                                                     \
+	static const struct net_buf_data_alloc net_buf_fixed_alloc_##_name = { \
+		.cb = &net_buf_fixed_cb,                                       \
+		.alloc_data = (void *)&net_buf_fixed_##_name,                  \
+		.max_alloc_size = _data_size,                                  \
+	};                                                                     \
+	static STRUCT_SECTION_ITERABLE(net_buf_pool, _name) =                  \
+		NET_BUF_POOL_INITIALIZER(_name, &net_buf_fixed_alloc_##_name,  \
+					 _net_buf_##_name, _count, _ud_size,   \
+					 _destroy)
+#else
+#define NET_BUF_POOL_FIXED_DEFINE_PSRAM(_name, _count, _data_size, _ud_size, _destroy) \
+	NET_BUF_POOL_FIXED_DEFINE(_name, _count, _data_size, _ud_size, _destroy)
+#endif
+
+/* Mirrors how NET_BUF_POOL_DEFINE aliases NET_BUF_POOL_FIXED_DEFINE. */
+#define NET_BUF_POOL_DEFINE_PSRAM(_name, _count, _size, _ud_size, _destroy) \
+	NET_BUF_POOL_FIXED_DEFINE_PSRAM(_name, _count, _size, _ud_size, _destroy)
 
 /** @cond INTERNAL_HIDDEN */
 extern const struct net_buf_data_cb net_buf_var_cb;

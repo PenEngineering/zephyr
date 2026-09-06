@@ -73,9 +73,9 @@ static void iso_rx_freed_cb(void)
  * the HCI transport to fill buffers in parallel with `bt_recv`
  * consuming them.
  */
-NET_BUF_POOL_FIXED_DEFINE(sync_evt_pool, 1, SYNC_EVT_SIZE, 0, NULL);
+NET_BUF_POOL_FIXED_DEFINE_PSRAM(sync_evt_pool, 1, SYNC_EVT_SIZE, 0, NULL);
 
-NET_BUF_POOL_FIXED_DEFINE(discardable_pool, CONFIG_BT_BUF_EVT_DISCARDABLE_COUNT,
+NET_BUF_POOL_FIXED_DEFINE_PSRAM(discardable_pool, CONFIG_BT_BUF_EVT_DISCARDABLE_COUNT,
 			  BT_BUF_EVT_SIZE(CONFIG_BT_BUF_EVT_DISCARDABLE_SIZE),
 			  0, NULL);
 
@@ -92,11 +92,11 @@ static void evt_pool_destroy(struct net_buf *buf)
 	buf_rx_freed_notify(BT_BUF_EVT);
 }
 
-NET_BUF_POOL_DEFINE(acl_in_pool, (BT_BUF_ACL_RX_COUNT_EXTRA + BT_BUF_HCI_ACL_RX_COUNT),
+NET_BUF_POOL_DEFINE_PSRAM(acl_in_pool, (BT_BUF_ACL_RX_COUNT_EXTRA + BT_BUF_HCI_ACL_RX_COUNT),
 		    BT_BUF_ACL_SIZE(CONFIG_BT_BUF_ACL_RX_SIZE), sizeof(struct bt_conn_rx),
 		    acl_in_pool_destroy);
 
-NET_BUF_POOL_FIXED_DEFINE(evt_pool, CONFIG_BT_BUF_EVT_RX_COUNT, BT_BUF_EVT_RX_SIZE, 0,
+NET_BUF_POOL_FIXED_DEFINE_PSRAM(evt_pool, CONFIG_BT_BUF_EVT_RX_COUNT, BT_BUF_EVT_RX_SIZE, 0,
 			  evt_pool_destroy);
 #else
 static void hci_rx_pool_destroy(struct net_buf *buf)
@@ -110,7 +110,7 @@ static void hci_rx_pool_destroy(struct net_buf *buf)
 	buf_rx_freed_notify(BT_BUF_EVT | BT_BUF_ACL_IN);
 }
 
-NET_BUF_POOL_FIXED_DEFINE(hci_rx_pool, BT_BUF_RX_COUNT, BT_BUF_RX_SIZE,
+NET_BUF_POOL_FIXED_DEFINE_PSRAM(hci_rx_pool, BT_BUF_RX_COUNT, BT_BUF_RX_SIZE,
 			  sizeof(struct bt_conn_rx), hci_rx_pool_destroy);
 #endif /* CONFIG_BT_HCI_ACL_FLOW_CONTROL */
 

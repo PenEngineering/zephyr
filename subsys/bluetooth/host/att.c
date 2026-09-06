@@ -99,7 +99,7 @@ struct bt_attr_data {
 };
 
 /* Pool for incoming ATT packets */
-NET_BUF_POOL_DEFINE(prep_pool, CONFIG_BT_ATT_PREPARE_COUNT, BT_ATT_BUF_SIZE,
+NET_BUF_POOL_DEFINE_PSRAM(prep_pool, CONFIG_BT_ATT_PREPARE_COUNT, BT_ATT_BUF_SIZE,
 		    sizeof(struct bt_attr_data), NULL);
 #endif /* CONFIG_BT_ATT_PREPARE_COUNT */
 
@@ -210,7 +210,16 @@ static struct bt_att_req cancel;
  */
 static k_tid_t att_handle_rsp_thread;
 
-static struct bt_att_tx_meta_data tx_meta_data_storage[CONFIG_BT_ATT_TX_COUNT];
+/* Moved off internal DRAM onto PSRAM where available: plain per-buffer
+ * metadata (indexed by net_buf_id), never touched by DMA/ISR — the actual
+ * HCI transport to this board's on-chip BT controller is a software VHCI
+ * handoff (esp_vhci_host_send_packet in hci_esp32.c), not a hardware DMA
+ * engine, so PSRAM is safe for BT buffers/metadata here. */
+static struct bt_att_tx_meta_data tx_meta_data_storage[CONFIG_BT_ATT_TX_COUNT]
+#if defined(CONFIG_SPIRAM)
+	__attribute__((section(".ext_ram.bss"), aligned(4)))
+#endif
+	;
 
 static struct bt_att_tx_meta_data *att_get_tx_meta_data(const struct net_buf *buf);
 static void att_on_sent_cb(struct bt_att_tx_meta_data *meta);
@@ -303,7 +312,7 @@ static void att_tx_destroy(struct net_buf *buf)
 	}
 }
 
-NET_BUF_POOL_DEFINE(att_pool, CONFIG_BT_ATT_TX_COUNT,
+NET_BUF_POOL_DEFINE_PSRAM(att_pool, CONFIG_BT_ATT_TX_COUNT,
 		    BT_L2CAP_SDU_BUF_SIZE(BT_ATT_BUF_SIZE),
 		    CONFIG_BT_CONN_TX_USER_DATA_SIZE, att_tx_destroy);
 
