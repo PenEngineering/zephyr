@@ -143,6 +143,32 @@ void vprintk(const char *fmt, va_list ap)
 }
 EXPORT_SYMBOL(vprintk);
 
+/* Raw, backend-free emergency print: formats into a stack buffer and
+ * writes straight out via k_str_out(), never touching the log core's
+ * message queue or backend dispatch (LOG_* / printk() under
+ * CONFIG_LOG_PRINTK=y both go through z_log_vprintk() and can end up
+ * blocked on whatever per-backend locking a registered backend does --
+ * e.g. the shell log backend's line-editing spinlock). Only the UART
+ * driver's own lock (if any) and CONFIG_PRINTK_SYNC's tiny dedicated
+ * lock in this file are in the way, so this is safe to call from a
+ * fatal-error/panic path where an arbitrary subsystem lock may already
+ * be stuck.
+ */
+void k_panic_print(const char *fmt, ...)
+{
+	char buf[128];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintk(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	if (n > 0) {
+		k_str_out(buf, MIN((size_t)n, sizeof(buf) - 1));
+	}
+}
+
 void z_impl_k_str_out(char *c, size_t n)
 {
 	size_t i;

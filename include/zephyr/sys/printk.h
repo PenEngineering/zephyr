@@ -47,6 +47,22 @@ extern "C" {
 __printf_like(1, 2) void printk(const char *fmt, ...);
 __printf_like(1, 0) void vprintk(const char *fmt, va_list ap);
 
+/**
+ * @brief Emergency print, bypassing the log core and all backends.
+ *
+ * Unlike printk()/LOG_*, this never goes through the log core's message
+ * queue or backend dispatch (relevant when CONFIG_LOG_PRINTK=y routes
+ * plain printk() through there too) -- it formats into a small stack
+ * buffer and writes directly out via k_str_out(). Intended for
+ * fatal-error/panic paths where an arbitrary subsystem's own backend
+ * lock may already be stuck and a normal print would deadlock instead
+ * of reporting the fault.
+ *
+ * @param fmt Format string.
+ * @param ... Optional list of format arguments.
+ */
+__printf_like(1, 2) void k_panic_print(const char *fmt, ...);
+
 #else
 static inline __printf_like(1, 2) void printk(const char *fmt, ...)
 {
@@ -57,6 +73,11 @@ static inline __printf_like(1, 0) void vprintk(const char *fmt, va_list ap)
 {
 	ARG_UNUSED(fmt);
 	ARG_UNUSED(ap);
+}
+
+static inline __printf_like(1, 2) void k_panic_print(const char *fmt, ...)
+{
+	ARG_UNUSED(fmt);
 }
 #endif
 

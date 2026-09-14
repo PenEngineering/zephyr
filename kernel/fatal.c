@@ -94,8 +94,17 @@ void z_fatal_error(unsigned int reason, const struct arch_esf *esf)
 
 	/* twister looks for the "ZEPHYR FATAL ERROR" string, don't
 	 * change it without also updating twister
+	 *
+	 * k_panic_print(), not LOG_ERR(): under CONFIG_LOG_PRINTK=y (and
+	 * LOG_ERR always), this would dispatch through the log core to
+	 * every registered backend, including e.g. the shell log backend's
+	 * line-editing code which takes its own spinlock -- if whatever
+	 * this fault interrupted was itself holding that lock, LOG_ERR()
+	 * here would deadlock instead of ever reporting the fault.
+	 * k_panic_print() bypasses the log core and backend dispatch
+	 * entirely.
 	 */
-	LOG_ERR(">>> ZEPHYR FATAL ERROR %d: %s on CPU %d", reason,
+	k_panic_print(">>> ZEPHYR FATAL ERROR %d: %s on CPU %d\n", reason,
 		reason_to_str(reason), _current_cpu->id);
 
 	/* FIXME: This doesn't seem to work as expected on all arches.
@@ -106,12 +115,12 @@ void z_fatal_error(unsigned int reason, const struct arch_esf *esf)
 	 */
 #if defined(CONFIG_ARCH_HAS_NESTED_EXCEPTION_DETECTION)
 	if ((esf != NULL) && arch_is_in_nested_exception(esf)) {
-		LOG_ERR("Fault during interrupt handling\n");
+		k_panic_print("Fault during interrupt handling\n");
 	}
 #endif /* CONFIG_ARCH_HAS_NESTED_EXCEPTION_DETECTION */
 
 	if (IS_ENABLED(CONFIG_MULTITHREADING)) {
-		LOG_ERR("Current thread: %p (%s)", thread, thread_name_get(thread));
+		k_panic_print("Current thread: %p (%s)\n", thread, thread_name_get(thread));
 	}
 
 	coredump(reason, esf, thread);

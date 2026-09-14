@@ -22,6 +22,20 @@
 
 LOG_MODULE_DECLARE(os, CONFIG_KERNEL_LOG_LEVEL);
 
+/* Local override: the stock EXCEPTION_DUMP(...) (zephyr/arch/exception.h)
+ * expands to LOG_ERR(), which under CONFIG_LOG_PRINTK=y is dispatched to
+ * every registered log backend -- including e.g. the shell log backend's
+ * line-editing code, which takes its own spinlock. If whatever thread
+ * this exception interrupted was itself mid critical-section on that
+ * same lock, LOG_ERR() here deadlocks instead of ever printing the
+ * fault. print_fatal_exception() runs before z_fatal_error()'s own
+ * LOG_PANIC() has a chance to run, so backends are not yet in any kind
+ * of panic-safe mode either. k_panic_print() bypasses the log core and
+ * backend dispatch entirely, so it can't hit that lock.
+ */
+#undef EXCEPTION_DUMP
+#define EXCEPTION_DUMP(fmt, ...) k_panic_print(fmt "\r\n", ##__VA_ARGS__)
+
 extern char xtensa_arch_except_epc[];
 extern char xtensa_arch_kernel_oops_epc[];
 

@@ -138,8 +138,14 @@ int xtensa_backtrace_print(int depth, int *interrupted_stack)
 	if (cause != EXCCAUSE_INSTR_PROHIBITED) {
 		mask = stk_frame.pc & 0xc0000000;
 	}
-	printk("\r\n\r\nBacktrace:");
-	printk("0x%08x:0x%08x ",
+	/* k_panic_print(), not printk(): this only ever runs from the fatal-
+	 * exception path (see fatal.c), where CONFIG_LOG_PRINTK=y would
+	 * otherwise route printk() through the log core's backend dispatch --
+	 * risking a deadlock on a backend's own lock (e.g. the shell log
+	 * backend) instead of ever printing.
+	 */
+	k_panic_print("\r\n\r\nBacktrace:");
+	k_panic_print("0x%08x:0x%08x ",
 			xtensa_cpu_process_stack_pc(stk_frame.pc),
 			stk_frame.sp);
 
@@ -155,18 +161,18 @@ int xtensa_backtrace_print(int depth, int *interrupted_stack)
 		if (!xtensa_backtrace_get_next_frame(&stk_frame)) {
 			corrupted = true;
 		}
-		printk("0x%08x:0x%08x ", xtensa_cpu_process_stack_pc(stk_frame.pc), stk_frame.sp);
+		k_panic_print("0x%08x:0x%08x ", xtensa_cpu_process_stack_pc(stk_frame.pc), stk_frame.sp);
 	}
 
 	/* Print backtrace termination marker */
 	int ret = 0;
 
 	if (corrupted) {
-		printk(" |<-CORRUPTED");
+		k_panic_print(" |<-CORRUPTED");
 		ret =  -1;
 	} else if (stk_frame.next_pc != 0) {    /* Backtrace continues */
-		printk(" |<-CONTINUES");
+		k_panic_print(" |<-CONTINUES");
 	}
-	printk("\r\n\r\n");
+	k_panic_print("\r\n\r\n");
 	return ret;
 }
