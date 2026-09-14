@@ -1267,6 +1267,21 @@ static ALWAYS_INLINE void halt_thread(struct k_thread *thread, uint8_t new_state
 			z_abort_thread_timeout(thread);
 			unpend_all(&thread->join_queue);
 
+#ifdef CONFIG_SMP
+			/* A thread dying here may have been mid critical
+			 * section (e.g. a fatal exception trapped while
+			 * holding irq_lock()) and will never reach its own
+			 * irq_unlock()/z_smp_global_unlock(). Left alone,
+			 * global_lock stays stuck forever and every future
+			 * irq_lock() on any core spins in atomic_cas()
+			 * permanently -- including inside the fatal-error
+			 * handler trying to report the very fault that
+			 * killed this thread. Release whatever share of the
+			 * lock it held so it isn't leaked.
+			 */
+			z_smp_force_release_global_lock(thread);
+#endif /* CONFIG_SMP */
+
 			/* Edge case: aborting _current from within an
 			 * ISR that preempted it requires clearing the
 			 * _current pointer so the upcoming context

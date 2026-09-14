@@ -90,6 +90,20 @@ void z_smp_release_global_lock(struct k_thread *thread)
 	}
 }
 
+/* Force-release the global lock on behalf of a thread that is being
+ * torn down (z_thread_halt(), new_state == _THREAD_DEAD) while still
+ * holding it. global_lock has at most one real holder system-wide, so
+ * a nonzero count here means this thread is that holder -- clearing
+ * it is always correct, never someone else's critical section.
+ */
+void z_smp_force_release_global_lock(struct k_thread *thread)
+{
+	if (thread->base.global_lock_count != 0U) {
+		thread->base.global_lock_count = 0U;
+		(void)atomic_clear(&global_lock);
+	}
+}
+
 /* Tiny delay that relaxes bus traffic to avoid spamming a shared
  * memory bus looking at an atomic variable
  */
